@@ -1,0 +1,14 @@
+# 运行时状态文件（自动生成，不入库）
+.state.yaml
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 密钥/本地备份
+.env
+*.bak
+
+# IDE
+.idea/
+.vscode/
