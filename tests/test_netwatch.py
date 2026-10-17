@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import analyzer
+import history
 import netwatch
 import probes
 
@@ -190,3 +191,160 @@ def test_report_rule_only_without_ai():
 
 def test_analyze_no_abnormal_returns_early():
     assert "无需分析" in analyzer.analyze([], ALL_UP)
+
+
+# ---------------------------------------------------------------- 告警去重 / 恢复通知
+
+def test_alert_fires_once_per_outage(tmp_path):
+    """同一场故障只报第一轮 —— 否则 15 分钟一次的定时任务会把手机刷爆。"""
+    state = tmp_path / ".state.yaml"
+    cfg = make_cfg([{"name": "dev", "ip": "10.0.0.9"}], threshold=1)
+    probe = fake_probe_factory(set())
+
+    first = netwatch.run_check(cfg, state, probe=probe)
+    assert [r["name"] for r in first["new_alerts"]] == ["dev"]
+    assert first["new_alerts"][0]["event"] == "down"
+
+    second = netwatch.run_check(cfg, state, probe=probe)
+    assert second["new_alerts"] == []                 # 还在故障中，但不重复告警
+    assert second["recoveries"] == []
+    assert second["has_news"] is False
+    assert second["results"][0]["abnormal"] is True   # 状态本身照旧是异常
+
+
+def test_recovery_is_reported_with_downtime(tmp_path):
+    """恢复也要主动报一次，并带上中断时长。"""
+    state = tmp_path / ".state.yaml"
+    cfg = make_cfg([{"name": "dev", "ip": "10.0.0.9"}], threshold=1)
+    netwatch.run_check(cfg, state, probe=fake_probe_factory(set()))
+    back = netwatch.run_check(cfg, state, probe=fake_probe_factory({"10.0.0.9"}))
+
+    assert [r["name"] for r in back["recoveries"]] == ["dev"]
+    assert back["recoveries"][0]["event"] == "up"
+    assert back["recoveries"][0]["down_minutes"] is not None    # 中断时长（分钟）
+    assert back["new_alerts"] == []
+    assert netwatch.load_state(state)["dev"]["alerted"] is False
+
+
+def test_down_since_survives_mid_outage_rounds(tmp_path):
+    """中断起点取「首次探测失败」那一刻，跨过阈值那轮也不重置。"""
+    state = tmp_path / ".state.yaml"
+    cfg = make_cfg([{"name": "dev", "ip": "10.0.0.9"}], threshold=3)
+    probe = fake_probe_factory(set())
+
+    first = netwatch.run_check(cfg, state, probe=probe)
+    start = first["results"][0]["down_since"]
+    assert start and first["new_alerts"] == []        # 未达阈值，先不报警
+
+    netwatch.run_check(cfg, state, probe=probe)
+    third = netwatch.run_check(cfg, state, probe=probe)
+    assert third["results"][0]["down_since"] == start  # 没被后一轮覆盖
+    assert [r["name"] for r in third["new_alerts"]] == ["dev"]   # 第 3 轮才告警
+
+
+def test_old_state_file_without_alert_fields(tmp_path):
+    """老状态文件（没 alerted/down_since）照样能跑，不会把已故障设备误判成新故障。"""
+    state = tmp_path / ".state.yaml"
+    state.write_text("dev:\n  streak: 5\n  last_ok: false\n", encoding="utf-8")
+    cfg = make_cfg([{"name": "dev", "ip": "10.0.0.9"}], threshold=2)
+    data = netwatch.run_check(cfg, state, probe=fake_probe_factory(set()))
+    assert data["results"][0]["streak"] == 6
+    assert data["new_alerts"] == []                   # 老状态没标记 → 不冒出新告警
+
+
+def test_format_report_shows_changes(tmp_path):
+    cfg = make_cfg([{"name": "dev", "ip": "10.0.0.9"}], threshold=1)
+    data = netwatch.run_check(cfg, tmp_path / ".state.yaml", probe=fake_probe_factory(set()))
+    text = netwatch.format_report(data, "2026-10-17 15:00:00")
+    assert "🔄 本次变化" in text
+    assert "新出现异常" in text
+
+    quiet = netwatch.run_check(cfg, tmp_path / ".state.yaml", probe=fake_probe_factory(set()))
+    assert "不重复告警" in netwatch.format_report(quiet, "t")
+
+
+def test_main_silent_when_no_new_change(tmp_path, monkeypatch, capsys):
+    """第一次告警，之后就安静 —— 这是挂 cron 的前提。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("devices:\n  - name: dead\n    ip: 192.0.2.1\ncheck:\n  down_threshold: 1\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(probes, "run_checks", fake_probe_factory(set()))
+
+    assert netwatch.main(["--config", str(cfg), "--silent-ok"]) == 0
+    assert "异常设备" in capsys.readouterr().out
+
+    assert netwatch.main(["--config", str(cfg), "--silent-ok"]) == 0
+    assert capsys.readouterr().out.strip() == "[SILENT]"
+
+
+def test_main_alert_on_all_repeats_every_round(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("devices:\n  - name: dead\n    ip: 192.0.2.1\ncheck:\n  down_threshold: 1\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(probes, "run_checks", fake_probe_factory(set()))
+
+    for _ in range(2):
+        assert netwatch.main(["--config", str(cfg), "--silent-ok", "--alert-on", "all"]) == 0
+        assert "异常设备" in capsys.readouterr().out
+
+
+def test_ai_called_only_for_new_alerts(tmp_path, monkeypatch, capsys):
+    """不重复告警也意味着不重复烧 token —— 用户在意成本。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("devices:\n  - name: dead\n    ip: 192.0.2.1\ncheck:\n  down_threshold: 1\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(probes, "run_checks", fake_probe_factory(set()))
+
+    calls = []
+    monkeypatch.setattr(netwatch, "analyze",
+                        lambda *a, **k: calls.append(a) or "AI 假结论")
+    monkeypatch.setattr(netwatch, "rule_hint", lambda *a, **k: "规则假结论")
+
+    netwatch.main(["--config", str(cfg), "--silent-ok", "--ai"])
+    assert "AI 假结论" in capsys.readouterr().out
+    netwatch.main(["--config", str(cfg), "--silent-ok", "--ai"])
+    assert capsys.readouterr().out.strip() == "[SILENT]"
+
+    assert len(calls) == 1                    # 第二轮没再调 AI
+
+
+def test_main_writes_history_db(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("devices:\n  - name: alive\n    ip: 127.0.0.1\ncheck:\n  down_threshold: 1\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(probes, "run_checks", fake_probe_factory({"127.0.0.1"}))
+    netwatch.main(["--config", str(cfg)])
+
+    db = tmp_path / ".history.db"
+    assert db.exists()
+    with history.open_db(db) as conn:
+        assert history.availability(conn)[0]["total"] == 1
+
+
+def test_history_can_be_disabled(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("devices:\n  - name: alive\n    ip: 127.0.0.1\nhistory:\n  enabled: false\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(probes, "run_checks", fake_probe_factory({"127.0.0.1"}))
+    netwatch.main(["--config", str(cfg)])
+    assert not (tmp_path / ".history.db").exists()
+
+
+def test_main_report_prints_availability(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("devices:\n  - name: alive\n    ip: 127.0.0.1\ncheck:\n  down_threshold: 1\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(probes, "run_checks", fake_probe_factory({"127.0.0.1"}))
+    netwatch.main(["--config", str(cfg)])
+
+    assert netwatch.main(["--config", str(cfg), "--report", "7d"]) == 0
+    out = capsys.readouterr().out
+    assert "可用率报告" in out
+    assert "100.0%" in out
+
+
+def test_main_report_rejects_bad_period(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("devices:\n  - name: alive\n    ip: 127.0.0.1\n", encoding="utf-8")
+    assert netwatch.main(["--config", str(cfg), "--report", "上周"]) == 0
+

@@ -25,31 +25,38 @@ netwatch-ai 把这三层分开探，**每个设备的明细都留在报告里**�
 
 ## 效果（真实终端输出）
 
-来自 `demo/sample_output.txt`（不是示意图，是实际跑出来的）：本地 8899 服务被 kill 掉之后，同一个脚本再跑一次 ——
+下面这段来自 `demo/sample_output.txt`（不是示意图，是 `python demo/run_demo.py --ai` 实际跑出来的）：把本地 8899 服务 kill 掉之后再跑一次 ——
 
 ```text
-=== netwatch-ai 巡检报告 2026-10-17 16:19:14 ===
+=== netwatch-ai 巡检报告 2026-10-17 17:17:50 ===
 ✓ localhost          127.0.0.1   在线 (连续离线 0 次)
-      └ ICMP 通 (1022ms)
+      └ ICMP 通 (1015ms)
 ⚠️ local-web          127.0.0.1   离线 (连续离线 1 次)
-      └ ICMP 通 (1024ms) | TCP 8899 连不上 (timed out) | HTTP 连不上 (<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>)
+      └ ICMP 通 (1013ms) | TCP 8899 连不上 (timed out) | HTTP 连不上 (<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>)
 ⚠️ unreachable-demo   192.0.2.1   离线 (连续离线 2 次)
       └ ICMP 不通 (rc=1)
 
 ⚠️ 发现 2 台异常设备: local-web, unreachable-demo
+🔄 本次变化: ⚠️ local-web 新出现异常 (连续离线 1 次)
 
 🧭 影响面判断:
 规则判断：**多台不可达**（共 2 台）→ 优先怀疑共同上级（交换机/网关/VLAN）。
 
 🤖 AI 分析:
-故障类型：local-web 为端口/服务异常；unreachable-demo 为设备宕机或网络中断。
-原因：local-web ICMP通但TCP 8899拒绝，疑似服务未启动或防火墙拦截；unreachable-demo ICMP不通，疑似设备离线或链路故障。
-修复建议：先检查local-web 8899端口监听及进程状态，再排查unreachable-demo的物理链路与设备状态。
+故障类型：端口或服务异常。
+可能原因：local-web 服务未启动或未监听 8899 端口。
+修复建议第一步：登录 local-web，检查 8899 端口监听状态并启动对应服务。
 ```
 
-（另见 `demo/sample_output.txt`：同一脚本在服务正常 / 服务被 kill 两种状态下的完整对比输出。）
-
 注意 `local-web` 那一行：**ICMP 通、TCP/HTTP 不通** —— 一眼就知道是服务挂了而不是设备失联。
+
+服务恢复后它会主动补一条「恢复通知」（不用你去盯）：
+
+```text
+🔄 本次变化: ✅ local-web 已恢复在线 (中断不到 1 分钟)
+```
+
+`demo/sample_output.txt` 里有连着跑的五个场景：正常 → 服务挂 → 状态没变化（**不重复告警**）→ 恢复 → 可用率报告。
 
 ## 架构
 
@@ -57,8 +64,9 @@ netwatch-ai 把这三层分开探，**每个设备的明细都留在报告里**�
 
 ```
 probes.py     探测层：ICMP / TCP / HTTP，跨平台（Windows/Linux/macOS 参数差异都在这里消化）
-netwatch.py   编排层：设备清单、连续离线计数、阈值判定、报告渲染
+netwatch.py   编排层：设备清单、连续离线计数、阈值判定、告警去重、报告渲染
 analyzer.py   AI 层：规则先判影响面，再让大模型说根因（key 只走环境变量）
+history.py    历史层：SQLite 落库（零依赖标准库），算可用率 / 中断时长 / 延迟趋势
 ```
 
 ## 快速开始
@@ -73,6 +81,12 @@ python netwatch.py --config config.yaml
 ```
 
 想立刻看效果（用演示配置，不需要任何真实设备）：
+
+```bash
+python demo/run_demo.py --ai     # 自己起/杀本地 8899 服务，跑完五个场景
+```
+
+或者手动跑单轮：
 
 ```bash
 python -m http.server 8899 &                              # 起个本地服务
@@ -128,20 +142,95 @@ ai:
 
 多个 check 是 **AND** 语义：任意一项失败即判该设备异常，但**明细全部保留**。
 
+## 命令行
+
+| 参数 | 作用 |
+|---|---|
+| `--config PATH` | 指定配置文件（默认 `./config.yaml`） |
+| `--ai` | 出现**新**异常时调大模型分析根因 |
+| `--silent-ok` | 没有新变化时只输出 `[SILENT]`，供定时任务抑制投递 |
+| `--alert-on change\|all` | `change`（默认）只在状态变化时告警；`all` 每轮异常都告警 |
+| `--report 7d` | 不探测，直接出可用率报告（`7d` / `24h` / `30m`） |
+| `--no-history` | 本轮不写历史库 |
+| `--once` | 只跑一轮（默认行为，保留以兼容旧命令） |
+
+## 告警去重与恢复通知
+
+定时巡检最容易翻车的不是漏报，是**刷屏**：一台设备挂了，10 分钟一次的巡检能连推三天，最后你把通知一关 —— 真出事时反而没人知道。
+
+所以默认 `--alert-on change`，只在**状态变化**时吭声：
+
+| 状态 | 是否通知 |
+|---|---|
+| 正常 → 异常 | ✅ 报一次（含影响面判断 + AI 分析） |
+| 一直异常 | ❌ 不重复（报告里状态照旧显示异常） |
+| 异常 → 正常 | ✅ 补一条「已恢复，中断约 X 分钟」 |
+| 一直正常 | ❌ `[SILENT]` |
+
+顺带省了 token：只有**新**故障才进 prompt，长期没修的故障不会每轮都调一次模型。去重状态存在 `.state.yaml`（跟配置文件放一起，已被 `.gitignore` 忽略）。
+
+想「每轮都提醒」（故障必须钉到修好为止），加 `--alert-on all`。
+
+## 历史数据与可用率报告
+
+每轮巡检往 SQLite 落一条记录（`history.py`，标准库 `sqlite3`，无额外依赖、不开后台进程、跑完即退）：
+
+```bash
+python netwatch.py --report 7d      # 也支持 24h / 30m
+```
+
+```text
+=== netwatch-ai 可用率报告 (2026-10-10 17:18:12 ~ 2026-10-17 17:18:12) ===
+
+设备                 地址              轮次      可用率       最长中断           平均探测
+-------------------------------------------------------------------------
+unreachable-demo   192.0.2.1        4     0.0% 4 轮 起10-17 17:17         2794ms
+local-web          127.0.0.1        4    50.0% 2 轮 起10-17 17:17         1535ms
+localhost          127.0.0.1        4   100.0%        0 轮         1017ms
+
+⚠️ 可用率低于 99% 的设备 2 台：unreachable-demo(0.0%), local-web(50.0%)
+```
+
+（演示数据只有 4 轮，真实用一周就是几百轮。）
+
+- **可用率** = 在线轮次 / 总轮次，最差的排最前
+- **最长中断** = 最长的一段连续离线**轮次**，并标出从哪一轮开始（用轮次而非分钟，因为巡检间隔由你的定时任务决定）
+- **平均探测** = 该设备每轮最慢那项探测的耗时，用来发现「还没断但开始变慢」的设备
+- 库里没数据会提示你先跑一轮，不会甩一张空表给你
+
 ## 接入定时任务
 
 ```bash
-*/5 * * * * cd /opt/netwatch-ai && NETWATCH_API_KEY=sk-xxx /usr/bin/python3 netwatch.py --ai --silent-ok
+# 每 10 分钟巡检一次：只在状态变化时通知（默认），新故障才调 AI
+*/10 * * * * cd /opt/netwatch-ai && NETWATCH_API_KEY=sk-xxx /usr/bin/python3 netwatch.py --ai --silent-ok
 ```
 
-`--silent-ok` 是给定时任务用的约定：**全部正常时只输出 `[SILENT]`**，调度器看到它就不投递消息 —— 不让"一切正常"变成每天几十条骚扰推送。异常时才输出完整报告，直接转到微信 / 钉钉 / 邮件 / webhook。
+Windows 任务计划（示例，路径改成你自己的）：
+
+```bat
+schtasks /create /tn netwatch /sc minute /mo 10 ^
+  /tr "C:\netwatch-ai\.venv\Scripts\python.exe C:\netwatch-ai\netwatch.py --ai --silent-ok"
+```
+
+`--silent-ok` 是给定时任务用的约定：**没有新变化时只输出 `[SILENT]`**，调度器看到它就不投递消息。
+
+| 本轮情况 | 输出 | 调度器行为 |
+|---|---|---|
+| 全部正常 | `[SILENT]` | 不投递 |
+| 有设备新掉线 | 完整报告 + 影响面 + AI 分析 | 投递（微信 / 钉钉 / 邮件 / webhook） |
+| 故障仍在持续 | `[SILENT]` | 不投递（不刷屏） |
+| 设备恢复 | 报告 + 「已恢复，中断约 X 分钟」 | 投递 |
+
+本机就是这么跑的：定时任务每 10 分钟一轮，报告直接推到手机，正常时整天一条消息都没有。
 
 ## 设计取舍
 
 - **多协议 AND + 分层明细**：不追求"探得越多越好"，而是让报告能区分「设备失联」和「服务挂了」——这是运维真正需要的判断。
 - **连续离线阈值**：单次 ping 失败太常见（无线抖动、ARP 超时），用 `down_threshold` 抗抖动，避免误报。
-- **规则先行，AI 补充**：全网断 vs 单台断是两条完全不同的排查路线，用确定性规则判断比让大模型猜更可靠；AI 只负责讲清原因和第一步。
+- **告警去重 + 恢复通知**：运维助手最大的敌人是刷屏。故障期间闭嘴，恢复时说一声，比每 10 分钟报一次有用得多。
+- **规则先行，AI 补充**：全网断 vs 单台断是两条完全不同的排查路线，用确定性规则判断比让大模型猜更可靠；AI 只负责讲清原因和第一步。影响面规则看**当前全量**异常（判断面），AI 只看**新**故障（省 token）。
 - **AI 挂了不影响巡检**：AI 调用失败只打印一行提示，巡检结果本身照常输出。
+- **历史层只用标准库**：SQLite 单文件、无依赖、无常驻进程 —— 巡检跑完就退，不和用户的游戏抢资源。
 - **key 只走环境变量**：仓库里永远不出现密钥；`config.yaml` 也被 `.gitignore` 忽略（真实内网 IP 不外泄），只提交 `config.example.yaml`。
 - **测试不碰真实网络**：没有测试会去 ping 真实设备，所以 CI 三平台都能稳定跑。
 
@@ -158,13 +247,13 @@ ai:
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q        # 56 个用例，覆盖探测逻辑 / 阈值状态机 / 报告渲染 / CLI 行为
+pytest -q        # 90 个用例，覆盖探测逻辑 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计 / CLI 行为
 ```
 
 ## Roadmap
 
-- [ ] 历史数据落 SQLite：可用率、MTBF、延迟趋势，`report --last 7d` 出周报
-- [ ] 恢复通知（down → up 时补一条"已恢复，中断 X 分钟"）与告警去重
+- [x] 历史数据落 SQLite：可用率 / 最长中断 / 延迟趋势 + `--report 7d`
+- [x] 恢复通知（down → up 时说一句「中断 X 分钟」）与告警去重
 - [ ] 结构化 AI 输出（故障类型 / 置信度 / 影响面 JSON），渲染成告警卡片
 - [ ] 通知渠道抽象成插件（微信 / 钉钉 / 邮件 / webhook）
 - [ ] 探测项扩展：SNMP、DNS 解析、traceroute
@@ -174,13 +263,15 @@ pytest -q        # 56 个用例，覆盖探测逻辑 / 阈值状态机 / 报告�
 
 ```
 netwatch-ai/
-├── netwatch.py              编排层：巡检主流程 + 报告
+├── netwatch.py              编排层：巡检主流程 + 告警去重 + 报告
 ├── probes.py                探测层：ICMP / TCP / HTTP
 ├── analyzer.py              AI 层：规则判断 + 大模型分析
+├── history.py               历史层：SQLite 落库 + 可用率统计
 ├── config.example.yaml      配置示例（真实 config.yaml 不进仓库）
 ├── demo/
+│   ├── run_demo.py          一键复现下面那份输出（自己起/杀本地服务）
 │   ├── config.demo.yaml     演示配置（本机 + 保留测试段）
-│   └── sample_output.txt    真实跑出来的输出
+│   └── sample_output.txt    真实跑出来的五个场景输出
 ├── docs/architecture.svg    架构图
 ├── tests/                   pytest 单测（不依赖外网）
 └── .github/workflows/ci.yml 三平台 CI

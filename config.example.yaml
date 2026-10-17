@@ -47,7 +47,16 @@ ai:
   # key 走环境变量，不写进配置文件：
   #   export NETWATCH_API_KEY=sk-xxxx
   # 想换中转/自建网关，用 NETWATCH_API_BASE 覆盖默认地址
+  # 中转站的模型名常和官方不同，用 NETWATCH_MODEL 指定，例如：
+  #   export NETWATCH_MODEL=deepseek-v4-flash
+
+# ---------------- 历史库（可选，默认开）----------------
+# 每轮巡检落一条 SQLite 记录，用来算可用率 / 中断时长 / 延迟趋势
+history:
+  enabled: true        # false = 不写库（巡检照常）
+  db: .history.db      # 相对路径时跟配置文件放一起（已被 .gitignore 忽略）
 
 # ---------------- 告警投递 ----------------
 notify:
   channel: weixin      # 由外部调度器（cron / Hermes / systemd timer）读取本行并投递
+  on: change           # change=只在状态变化时告警（默认，防刷屏）；all=每轮异常都告警

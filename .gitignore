@@ -5,6 +5,10 @@ config.yaml
 .state.yaml
 **/.state.yaml
 
+# 历史库（自动生成）
+.history.db
+**/.history.db
+
 # Python 缓存 / 虚拟环境 / 测试产物
 __pycache__/
 *.pyc
