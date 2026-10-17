@@ -32,7 +32,7 @@ netwatch-ai 把这三层分开探，**每个设备的明细都留在报告里**�
 ✓ localhost          127.0.0.1   在线 (连续离线 0 次)
       └ ICMP 通 (1022ms)
 ⚠️ local-web          127.0.0.1   离线 (连续离线 1 次)
-      └ ICMP 通 (1024ms) | TCP 8899 连不上 (timed out) | HTTP 连不上 ([WinError 10061] 目标计算机积极拒绝)
+      └ ICMP 通 (1024ms) | TCP 8899 连不上 (timed out) | HTTP 连不上 (<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>)
 ⚠️ unreachable-demo   192.0.2.1   离线 (连续离线 2 次)
       └ ICMP 不通 (rc=1)
 
@@ -43,9 +43,11 @@ netwatch-ai 把这三层分开探，**每个设备的明细都留在报告里**�
 
 🤖 AI 分析:
 故障类型：local-web 为端口/服务异常；unreachable-demo 为设备宕机或网络中断。
-原因：local-web ICMP 通但 TCP 8899 拒绝，疑似服务未启动或防火墙拦截；unreachable-demo ICMP 不通，疑似设备离线或链路故障。
-修复建议：先检查 local-web 8899 端口监听及进程状态，再排查 unreachable-demo 的物理链路与设备状态。
+原因：local-web ICMP通但TCP 8899拒绝，疑似服务未启动或防火墙拦截；unreachable-demo ICMP不通，疑似设备离线或链路故障。
+修复建议：先检查local-web 8899端口监听及进程状态，再排查unreachable-demo的物理链路与设备状态。
 ```
+
+（另见 `demo/sample_output.txt`：同一脚本在服务正常 / 服务被 kill 两种状态下的完整对比输出。）
 
 注意 `local-web` 那一行：**ICMP 通、TCP/HTTP 不通** —— 一眼就知道是服务挂了而不是设备失联。
 
