@@ -1,12 +1,22 @@
-# 运行时状态文件（自动生成，不入库）
-.state.yaml
+# 本地真实配置（含真实内网 IP / 中转地址），只提交 config.example.yaml
+config.yaml
 
-# Python 缓存
+# 巡检状态文件（自动生成）
+.state.yaml
+**/.state.yaml
+
+# Python 缓存 / 虚拟环境 / 测试产物
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv/
+venv/
 
-# 密钥/本地备份
+# 日志与密钥
+*.log
 .env
+
+# 本地备份
 *.bak
 
 # IDE

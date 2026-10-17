@@ -1,0 +1,53 @@
+# ============================================================
+# netwatch-ai 配置示例
+#
+# 用法：复制成 config.yaml 再改（config.yaml 已被 .gitignore 忽略，
+#      你的真实设备清单不会进仓库）
+#       cp config.example.yaml config.yaml
+# ============================================================
+
+devices:
+  # --- 基本信息：name 用于告警里点名，ip 是探测目标 ---
+  - name: router
+    ip: 192.168.1.1
+    kind: gateway              # 只作备注，便于人看
+    checks: [icmp]             # 不写 checks 时默认就是 [icmp]
+
+  # --- 多协议探测：ICMP + SSH 端口 + HTTP 健康页，全部通过才算在线 ---
+  - name: nas
+    ip: 192.168.1.10
+    checks:
+      - icmp
+      - tcp:22
+      - http://192.168.1.10:5000/health
+
+  # --- 禁 ICMP 的设备（不少云主机/防火墙默认拒绝 ping）：只探端口 ---
+  - name: cloud-vm
+    ip: 10.0.0.8
+    note: 云主机禁 ICMP，用 TCP 22 探活
+    checks: [tcp:22]
+
+  # --- 虚拟机/临时设备：关机是正常的，down_threshold 之外还会在报告里显示明细 ---
+  - name: ubuntu-vm
+    ip: 192.168.56.10
+    note: 虚拟机关机后不可达（正常现象）
+
+# ---------------- 巡检参数 ----------------
+check:
+  ping_count: 3        # 每次 ping 发几个包
+  ping_timeout: 1      # 单个包超时(秒)
+  tcp_timeout: 2       # TCP 连接超时(秒)
+  http_timeout: 3      # HTTP 请求超时(秒)
+  down_threshold: 2    # 连续 N 轮离线才判定为「异常」（抗网络抖动）
+
+# ---------------- AI 分析（可选）----------------
+ai:
+  enabled: true
+  provider: deepseek
+  # key 走环境变量，不写进配置文件：
+  #   export NETWATCH_API_KEY=sk-xxxx
+  # 想换中转/自建网关，用 NETWATCH_API_BASE 覆盖默认地址
+
+# ---------------- 告警投递 ----------------
+notify:
+  channel: weixin      # 由外部调度器（cron / Hermes / systemd timer）读取本行并投递

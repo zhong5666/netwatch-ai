@@ -1,0 +1,43 @@
+# netwatch-ai 实测输出（真实终端输出，非示意）
+#
+# 环境：Windows 11 + Python 3.11
+# 配置：demo/config.demo.yaml
+#   localhost        127.0.0.1   本机
+#   local-web        127.0.0.1   多协议探测 ICMP + TCP:8899 + HTTP，服务由 `python -m http.server 8899` 提供
+#   unreachable-demo 192.0.2.1   RFC 5737 保留测试段，永不响应
+#
+# ────────── 场景一：8899 服务正常运行 ──────────
+
+=== netwatch-ai 巡检报告 2026-10-17 16:19:03 ===
+✓ localhost          127.0.0.1   在线 (连续离线 0 次)
+      └ ICMP 通 (1025ms)
+✓ local-web          127.0.0.1   在线 (连续离线 0 次)
+      └ ICMP 通 (1023ms) | TCP 8899 可连 (28ms) | HTTP 200 (18ms)
+⚠️ unreachable-demo   192.0.2.1   离线 (连续离线 1 次)
+      └ ICMP 不通 (rc=1)
+
+⚠️ 发现 1 台异常设备: unreachable-demo
+
+🧭 影响面判断:
+规则判断：**仅单台设备不可达** → 优先怀疑该设备自身（电源/网线/服务），网络整体是通的。
+
+# ────────── 场景二：kill 掉 8899 服务后，同一个巡检脚本再跑一次 ──────────
+# 注意 local-web 的明细：ICMP 通、TCP/HTTP 不通 —— 一眼区分「设备失联」和「服务挂了」
+
+=== netwatch-ai 巡检报告 2026-10-17 16:19:14 ===
+✓ localhost          127.0.0.1   在线 (连续离线 0 次)
+      └ ICMP 通 (1022ms)
+⚠️ local-web          127.0.0.1   离线 (连续离线 1 次)
+      └ ICMP 通 (1024ms) | TCP 8899 连不上 (timed out) | HTTP 连不上 (<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>)
+⚠️ unreachable-demo   192.0.2.1   离线 (连续离线 2 次)
+      └ ICMP 不通 (rc=1)
+
+⚠️ 发现 2 台异常设备: local-web, unreachable-demo
+
+🧭 影响面判断:
+规则判断：**多台不可达**（共 2 台）→ 优先怀疑共同上级（交换机/网关/VLAN）。
+
+🤖 AI 分析:
+故障类型：local-web 为端口/服务异常；unreachable-demo 为设备宕机或网络中断。  
+原因：local-web ICMP通但TCP 8899拒绝，疑似服务未启动或防火墙拦截；unreachable-demo ICMP不通，疑似设备离线或链路故障。  
+修复建议：先检查local-web 8899端口监听及进程状态，再排查unreachable-demo的物理链路与设备状态。

@@ -1,0 +1,39 @@
+# ============================================================
+# 演示用配置（README 里的效果输出就是用它跑出来的）
+#
+#   127.0.0.1        : 本机，ICMP 一定通
+#   192.0.2.1        : RFC 5737 保留测试段(TEST-NET-1)，永不响应 —— 用来演示离线告警
+#   local-web        : 演示多协议探测，配一个本地 8899 端口
+#
+# 跑法：
+#   python -m http.server 8899 &                 # 起个本地服务
+#   python netwatch.py --config demo/config.demo.yaml
+# ============================================================
+
+devices:
+  - name: localhost
+    ip: 127.0.0.1
+    checks: [icmp]
+
+  - name: local-web
+    ip: 127.0.0.1
+    note: 多协议演示：ICMP + TCP + HTTP
+    checks:
+      - icmp
+      - tcp:8899
+      - http://127.0.0.1:8899/
+
+  - name: unreachable-demo
+    ip: 192.0.2.1
+    note: RFC5737 保留段，永不响应
+    checks: [icmp]
+
+check:
+  ping_count: 2
+  ping_timeout: 1
+  tcp_timeout: 2
+  http_timeout: 3
+  down_threshold: 1     # 演示用：第一轮就报异常
+
+ai:
+  enabled: true
