@@ -30,10 +30,12 @@ import yaml
 import probes
 
 try:
-    from analyzer import analyze, rule_hint
+    from analyzer import analyze, rule_hint, parse_analysis, render_card
 except ImportError:          # 没配 AI 也能靠纯规则跑巡检
     analyze = None
     rule_hint = None
+    parse_analysis = None
+    render_card = None
 
 try:
     import history
@@ -317,7 +319,12 @@ def main(argv=None) -> int:
                 print("(analyzer 不可用：请确认 analyzer.py 存在)")
             else:
                 try:
-                    print(analyze(alerting, data["results"], ts_text=ts))
+                    raw = analyze(alerting, data["results"], ts_text=ts)
+                    # 结构化优先：模型按约定回 JSON 就渲染卡片；没按约定就退回原文（内容不丢）
+                    if parse_analysis is not None and render_card is not None:
+                        print(render_card(parse_analysis(raw)))
+                    else:
+                        print(raw)
                 except Exception as e:      # AI 挂了不能影响巡检结果本身
                     print("(AI 分析失败: %s)" % e)
     elif abnormal:

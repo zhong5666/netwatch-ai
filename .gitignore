@@ -23,6 +23,9 @@ venv/
 # 本地备份
 *.bak
 
+# 本地交接笔记（不进公开仓库）
+*.local.md
+
 # IDE
 .idea/
 .vscode/
