@@ -24,6 +24,24 @@ def fake_probe_factory(up_hosts):
     return fake_probe
 
 
+@pytest.fixture(autouse=True)
+def no_real_traceroute(monkeypatch):
+    """单测一律不真跑 traceroute。
+
+    编排层默认开着它（设备一异常就发车），真跑一次要好几秒、还依赖真实网络，
+    在 CI 里既慢又不稳。这里统一换成假函数，并把调用记下来给用例断言。
+    """
+    calls = []
+
+    def fake(host, hops=None, timeout=None, **kwargs):
+        calls.append((host, hops, timeout))
+        return probes.ProbeResult("traceroute", host, True, 7,
+                                  "traceroute: 第 2 跳 10.0.0.1 之后无响应 → 断在内网（假数据）")
+
+    monkeypatch.setattr(probes, "probe_traceroute", fake)
+    return calls
+
+
 def make_cfg(devices, threshold=2):
     return {
         "devices": devices,
@@ -342,6 +360,91 @@ def test_main_report_prints_availability(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "可用率报告" in out
     assert "100.0%" in out
+
+
+# ---------------------------------------------------------------- 按需 traceroute
+
+def test_traceroute_runs_only_for_abnormal_devices(tmp_path, no_real_traceroute):
+    """正常设备零开销：只有跨过阈值的设备才补跑一次 traceroute。"""
+    cfg = make_cfg([{"name": "up", "ip": "10.0.0.9"},
+                    {"name": "down", "ip": "10.0.0.8"}], threshold=1)
+    data = netwatch.run_check(cfg, tmp_path / ".state.yaml", probe=fake_probe_factory({"10.0.0.9"}))
+
+    assert [c[0] for c in no_real_traceroute] == ["10.0.0.8"]
+    down = [r for r in data["results"] if r["name"] == "down"][0]
+    up = [r for r in data["results"] if r["name"] == "up"][0]
+    assert "traceroute: 第 2 跳" in down["detail"]          # 明细里多了一句「断在哪」
+    assert "traceroute" not in up["detail"]
+    assert [c["kind"] for c in down["checks"]] == ["icmp", "traceroute"]
+
+
+def test_traceroute_does_not_change_verdict(tmp_path, no_real_traceroute):
+    """补充诊断不能反过来影响判定：设备该异常还是异常、该新告警还是新告警。"""
+    cfg = make_cfg([{"name": "down", "ip": "10.0.0.8"}], threshold=1)
+    data = netwatch.run_check(cfg, tmp_path / ".state.yaml", probe=fake_probe_factory(set()))
+
+    row = data["results"][0]
+    assert row["ok"] is False and row["abnormal"] is True
+    assert [r["name"] for r in data["new_alerts"]] == ["down"]
+    assert [r["name"] for r in data["recoveries"]] == []
+
+
+def test_traceroute_can_be_turned_off(tmp_path, no_real_traceroute):
+    cfg = {"devices": [{"name": "down", "ip": "10.0.0.8"}],
+           "check": {"down_threshold": 1, "traceroute": False}}
+    data = netwatch.run_check(cfg, tmp_path / ".state.yaml", probe=fake_probe_factory(set()))
+
+    assert no_real_traceroute == []
+    assert "traceroute" not in data["results"][0]["detail"]
+
+
+def test_traceroute_hops_and_timeout_come_from_config(tmp_path, no_real_traceroute):
+    cfg = {"devices": [{"name": "down", "ip": "10.0.0.8"}],
+           "check": {"down_threshold": 1, "traceroute": "auto",
+                     "traceroute_hops": 3, "traceroute_timeout": 0.5}}
+    netwatch.run_check(cfg, tmp_path / ".state.yaml", probe=fake_probe_factory(set()))
+
+    assert no_real_traceroute == [("10.0.0.8", 3, 0.5)]
+
+
+def test_traceroute_crash_does_not_break_the_round(tmp_path, monkeypatch):
+    """护栏不能变故障源：诊断自己炸了，这一轮巡检结论照常出。"""
+    def boom(*a, **k):
+        raise RuntimeError("诊断脚本写挂了")
+    monkeypatch.setattr(probes, "probe_traceroute", boom)
+
+    cfg = make_cfg([{"name": "down", "ip": "10.0.0.8"}], threshold=1)
+    data = netwatch.run_check(cfg, tmp_path / ".state.yaml", probe=fake_probe_factory(set()))
+
+    row = data["results"][0]
+    assert row["abnormal"] is True
+    assert [c["kind"] for c in row["checks"]] == ["icmp"]     # 没有 traceroute 项，但结论照旧
+
+
+def test_traceroute_only_on_the_alerting_round(tmp_path, no_real_traceroute):
+    """常态（--alert-on change）只在新告警那一轮补跑 —— 和「不刷屏」同一时机。
+
+    常年不通的设备每 10 分钟重跑一遍 tracert，一台就 1~11 秒，纯浪费。
+    """
+    cfg = make_cfg([{"name": "down", "ip": "10.0.0.8"}], threshold=1)
+    state = tmp_path / ".state.yaml"
+    probe = fake_probe_factory(set())
+
+    netwatch.run_check(cfg, state, probe=probe)          # 第 1 轮：新告警 → 跑
+    assert len(no_real_traceroute) == 1
+    netwatch.run_check(cfg, state, probe=probe)          # 第 2 轮：已告警过 → 不跑
+    assert len(no_real_traceroute) == 1
+
+
+def test_traceroute_every_round_in_alert_all_mode(tmp_path, no_real_traceroute):
+    """人工排查走 --alert-on all：异常设备每轮都给「断在第几跳」，不省这点时间。"""
+    cfg = make_cfg([{"name": "down", "ip": "10.0.0.8"}], threshold=1)
+    state = tmp_path / ".state.yaml"
+    probe = fake_probe_factory(set())
+
+    netwatch.run_check(cfg, state, probe=probe, alert_on="all")
+    netwatch.run_check(cfg, state, probe=probe, alert_on="all")
+    assert len(no_real_traceroute) == 2
 
 
 def test_main_report_rejects_bad_period(tmp_path):

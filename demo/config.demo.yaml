@@ -41,6 +41,10 @@ check:
   http_timeout: 3
   dns_timeout: 5
   down_threshold: 1     # 演示用：第一轮就报异常
+  # 演示关掉 traceroute：一来会往真实链路发包（演示承诺「不碰真实设备」），
+  # 二来跳数随所在网络变，README 引用的输出就不再可复现。
+  # 真实排查时用默认的 auto（见 README「按需诊断」那段）。
+  traceroute: false
 
 ai:
   enabled: true

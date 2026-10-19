@@ -94,10 +94,11 @@ def save_state(path, state: dict) -> None:
 
 # ---------------------------------------------------------------- 巡检
 
-def run_check(cfg: dict, state_file, probe=None) -> dict:
+def run_check(cfg: dict, state_file, probe=None, alert_on: str = "change") -> dict:
     """跑一轮巡检，并算出「相比上一轮的变化」。
 
     probe 可注入（默认 probes.run_checks），单测里换成假探测函数即可离线验证全部逻辑。
+    alert_on 决定 traceroute 什么时候补跑（见下面 want_trace 那段），和 CLI 的 --alert-on 同义。
 
     返回里的 new_alerts / recoveries 是告警去重的核心：
     故障没修好之前不会每轮都吵一遍，设备恢复时反而会主动报一次。
@@ -108,6 +109,10 @@ def run_check(cfg: dict, state_file, probe=None) -> dict:
     tcp_timeout = int(check.get("tcp_timeout", probes.TCP_TIMEOUT_DEFAULT))
     http_timeout = int(check.get("http_timeout", probes.HTTP_TIMEOUT_DEFAULT))
     dns_timeout = int(check.get("dns_timeout", probes.DNS_TIMEOUT_DEFAULT))
+    # 设备判定异常后补跑 traceroute：正常设备零开销（traceroute_enabled 的默认值是开）
+    traceroute_on = probes.traceroute_enabled(check.get("traceroute"))
+    traceroute_hops = int(check.get("traceroute_hops", probes.TRACEROUTE_HOPS_DEFAULT))
+    traceroute_timeout = float(check.get("traceroute_timeout", probes.TRACEROUTE_TIMEOUT_DEFAULT))
     threshold = int(check.get("down_threshold", 2))
     probe = probe or probes.run_checks
 
@@ -159,6 +164,19 @@ def run_check(cfg: dict, state_file, probe=None) -> dict:
             "alerted": abnormal,
             "down_since": down_since,
         }
+
+        # 什么时候补跑 traceroute（回答「断在第几跳」）：
+        #   * --alert-on change（cron 常态）：只在这台设备**新告警**这一轮跑 —— 和新消息推送
+        #     同一时机，常年不通的设备不必每 10 分钟重跑一遍 tracert（一台 1~11 秒）；
+        #   * --alert-on all（人工排查 / 演示）：异常设备一律补跑，看全量。
+        # 它是补充诊断：不改 ok / 不改 abnormal，只往明细后面接一句。
+        want_trace = traceroute_on and abnormal and (event == "down" or alert_on == "all")
+        if want_trace:
+            try:
+                items = list(items) + [probes.probe_traceroute(host, traceroute_hops, traceroute_timeout)]
+                detail = " | ".join(str(i) for i in items)
+            except Exception as e:      # 护栏不能变故障源：诊断挂了只跳过它，本轮结论照旧
+                print("(traceroute 诊断失败: %s)" % e)
 
         item = {
             "name": name,
@@ -350,7 +368,7 @@ def main(argv=None) -> int:
         print("配置里没有任何设备，请先在 devices: 下加设备清单。")
         return 0
 
-    data = run_check(cfg, state_path_for(cfg_path))
+    data = run_check(cfg, state_path_for(cfg_path), alert_on=args.alert_on)
     ts = time.strftime(TS_FMT)
 
     # ---- 落历史库（失败不能影响巡检结论）

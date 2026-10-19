@@ -1,6 +1,6 @@
 # netwatch-ai 🛰️
 
-**网络巡检 + AI 告警**：定时巡检局域网设备 → **分层探测**（ICMP / TCP 端口 / HTTP / DNS 解析）定位到底哪一层断了 → 规则先判断影响面，AI 再说清根因 → 只在真出事时通知你（终端打印 + webhook 推送，渠道可插拔）。
+**网络巡检 + AI 告警**：定时巡检局域网设备 → **分层探测**（ICMP / TCP 端口 / HTTP / DNS 解析）定位到底哪一层断了，判定异常再**按需补一次 traceroute** 说清断在第几跳 → 规则先判断影响面，AI 再说清根因 → 只在真出事时通知你（终端打印 + webhook 推送，渠道可插拔）。
 
 [![CI](https://github.com/zhong5666/netwatch-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/zhong5666/netwatch-ai/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
@@ -21,10 +21,20 @@
 | ICMP 通，TCP 端口不通 | 设备活着，服务没起 | 登录设备看服务进程 |
 | ICMP 通，HTTP 返回 500 | 设备和服务都在，程序自己报错 | 看应用日志 |
 | 别的都通，域名解析不了 | 网没坏，是 DNS 挂了 | 查 DNS 服务器 / 本机解析配置（不是去拔网线） |
+| ICMP 不通，traceroute 卡在第 N 跳之后 | 断点之前是通的，之后不通 | 先看断在哪一段：本机 / 局域网 / 公网，再查对应那段 |
 
 netwatch-ai 把这四层分开探，**每个设备的明细都留在报告里**，再交给大模型说清根因和第一步该干什么。
 
 其中「多台设备同时 DNS 解析失败」由**规则层**直接点破：线路多半是通的，先查 DNS 服务器，别去拆交换机 —— `dns:` 这项探测就是为了抓这种最容易被误诊的故障。
+
+设备**已经判定异常**时，netwatch 会按需补跑一次 traceroute（`check.traceroute: auto`，默认开），把结论并进同一行明细：
+
+- **本机这边就出不去** —— Windows 在同网段没人应答时会把**本机自己的地址**印成第一跳，程序拿本机出口地址一比就认得出 → 先查本机网卡 / 网线 / 无线，别去查远端；
+- **过了第 N 跳才不通** —— 并区分那一跳是私网还是公网地址：断在局域网侧（查交换机 / 该设备）还是已出内网（查线路 / 目标侧）；
+- **已到目标** —— 链路是通的，问题在这台设备本身（服务 / 端口 / 防火墙策略）。
+
+它只在**报警的那一轮**跑（和推送同一时机），常态巡检一分钱不花；人工排查想每轮都看，加 `--alert-on all`。
+`demo/config.demo.yaml` 里显式关掉了它 —— 演示承诺不往真实链路发包，而且跳数随所在网络变、README 引用的输出就不可复现了。
 
 ## 效果（真实终端输出）
 
@@ -75,7 +85,7 @@ AI 段是**结构化卡片**：大模型只回 JSON（类型 / 置信度 / 影�
 ![架构图](docs/architecture.svg)
 
 ```
-probes.py     探测层：ICMP / TCP / HTTP / DNS 解析，跨平台（Windows/Linux/macOS 参数差异都在这里消化）
+probes.py     探测层：ICMP / TCP / HTTP / DNS 解析 + 按需 traceroute，跨平台（Windows/Linux/macOS 参数差异都在这里消化）
 netwatch.py   编排层：设备清单、连续离线计数、阈值判定、告警去重、报告渲染
 analyzer.py   AI 层：规则先判影响面，再让大模型说根因（key 只走环境变量）
 notifiers.py  通知层：把报告推到 webhook 等渠道（插件化，失败不影响巡检）
@@ -158,6 +168,9 @@ check:
   http_timeout: 3        # HTTP 请求超时(秒)
   dns_timeout: 5         # DNS 解析超时(秒)
   down_threshold: 2      # 连续 N 轮离线才算异常（抗网络抖动）
+  traceroute: auto       # 设备判定异常时按需补跑一次（auto 默认 = 开；false 关掉）
+  traceroute_hops: 5     # traceroute 最多探几跳
+  traceroute_timeout: 1  # traceroute 每跳等几秒（Windows 内部换算成毫秒）
 
 ai:
   enabled: true
@@ -178,6 +191,8 @@ notify:                       # 通知渠道（可选；不配就只打印到终
 
 多个 check 是 **AND** 语义：任意一项失败即判该设备异常，但**明细全部保留**。
 
+traceroute 不是 check —— 它是**判定异常之后**的补充诊断，写在 `check.traceroute`，不参与 AND 判定，也不进「平均探测」口径。
+
 ## 命令行
 
 | 参数 | 作用 |
@@ -185,7 +200,7 @@ notify:                       # 通知渠道（可选；不配就只打印到终
 | `--config PATH` | 指定配置文件（默认 `./config.yaml`） |
 | `--ai` | 出现**新**异常时调大模型分析根因 |
 | `--silent-ok` | 没有新变化时只输出 `[SILENT]`，供定时任务抑制投递 |
-| `--alert-on change\|all` | `change`（默认）只在状态变化时告警；`all` 每轮异常都告警 |
+| `--alert-on change\|all` | `change`（默认）只在状态变化时告警；`all` 每轮异常都告警，并且每轮都给 traceroute 明细（人工排查用） |
 | `--report 7d` | 不探测，直接出可用率报告（`7d` / `24h` / `30m`） |
 | `--no-history` | 本轮不写历史库 |
 | `--notify` | 按 `notify.channels` 把报告推到外部渠道（**没这个参数绝不发送**） |

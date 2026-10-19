@@ -63,6 +63,16 @@ def test_ms_is_max_of_checks(tmp_path):
         assert history.availability(conn)[0]["avg_ms"] == 88
 
 
+def test_traceroute_ms_is_excluded_from_latency(tmp_path):
+    """按需诊断的耗时（秒级）不能混进「平均探测」口径，否则延迟趋势被带偏。"""
+    d = {"name": "nas", "ip": "10.0.0.2", "ok": False, "streak": 3, "detail": "不通",
+         "checks": [{"kind": "icmp", "ms": 12},
+                    {"kind": "traceroute", "ms": 5200}]}
+    with history.open_db(tmp_path / "h.db") as conn:
+        history.record(conn, data(d), "2026-10-19 10:00:00")
+        assert history.availability(conn)[0]["avg_ms"] == 12
+
+
 # ---------------------------------------------------------------- 可用率 / 中断
 
 def test_availability_is_ok_ratio(tmp_path):

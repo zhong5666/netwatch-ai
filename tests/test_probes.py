@@ -297,3 +297,214 @@ def test_run_checks_dns_failure_hits_device(monkeypatch):
     ok, detail, _ = probes.run_checks("10.0.0.1", ["icmp", "dns:example.com"], dns_timeout=2)
     assert ok is False
     assert "ICMP 通" in detail and "DNS 解析失败" in detail
+
+# ---------------------------------------------------------------- traceroute（按需诊断，不碰真网络）
+
+WIN_TRACERT = """通过最多 5 个跃点跟踪到 192.0.2.1 的路由
+
+  1     4 ms     5 ms     4 ms  10.60.43.254
+  2     *        *        *     请求超时。
+  3     *        *        *     请求超时。
+
+跟踪完成。
+"""
+
+UNIX_TRACEROUTE = """traceroute to 192.0.2.1 (192.0.2.1), 5 hops max, 60 byte packets
+ 1  10.60.43.254  4.113 ms
+ 2  *
+ 3  *
+"""
+
+# 真实抓的：同网段但没人应答（Windows 会把自己的地址印在跳号后，别当成本机回应）
+WIN_UNREACH_LOCAL = "\r\n通过最多 5 个跃点跟踪到 10.60.43.250 的路由\r\n\r\n  1     *     10.60.42.62  报告: 无法访问目标主机。\r\n\r\n跟踪完成。\r\n"
+
+# 某一跳明确回了「目标不可达」：三个探测位都有值，说明包确实到了它
+WIN_UNREACH_HOP = """通过最多 5 个跃点跟踪到 192.0.2.1 的路由
+
+  1     4 ms     5 ms     4 ms  10.60.43.254
+  2     *        *        *     请求超时。
+  3     2 ms     2 ms     2 ms  172.16.0.9  报告: 无法访问目标主机。
+"""
+
+
+class _FakeProc:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout, self.returncode = stdout, returncode
+
+
+def test_build_traceroute_cmd_windows_milliseconds():
+    """Windows 的 tracert -w 是**毫秒**，而且跳数上限是 -h。"""
+    cmd = probes.build_traceroute_cmd("192.0.2.1", hops=5, timeout=1, system="windows")
+    assert cmd == ["tracert", "-d", "-h", "5", "-w", "1000", "192.0.2.1"]
+
+
+@pytest.mark.parametrize("system", ["darwin", "linux"])
+def test_build_traceroute_cmd_unix_seconds(system):
+    """Unix 的 -w 是**秒** —— 和 ping 正好相反（ping 在 macOS 是毫秒），别照搬。"""
+    cmd = probes.build_traceroute_cmd("192.0.2.1", hops=4, timeout=2, system=system)
+    assert cmd == ["traceroute", "-n", "-q", "1", "-m", "4", "-w", "2", "192.0.2.1"]
+    assert "-d" not in cmd          # -d 是 tracert 的关闭反解写法，Unix 用 -n
+
+
+def test_build_traceroute_cmd_accepts_float_timeout():
+    assert probes.build_traceroute_cmd("h", hops=3, timeout=0.5, system="linux")[-2] == "0.5"
+    assert probes.build_traceroute_cmd("h", timeout=0.5, system="windows")[-2] == "500"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, True), ("auto", True), ("true", True), ("on", True), ("yes", True),
+    ("false", False), ("off", False), ("no", False), ("0", False), ("none", False),
+    ("AUTO", True), ("  off  ", False),
+    ("flase", True),            # 拼错不能把诊断功能搞没：认不出一律按默认（开）
+])
+def test_traceroute_enabled(raw, expected):
+    assert probes.traceroute_enabled(raw) is expected
+
+
+def test_parse_traceroute_windows():
+    """Windows 一行三列毫秒，「请求超时。」那一跳没有 IP → 记 None（不是 0.0.0.0）。"""
+    assert probes.parse_traceroute(WIN_TRACERT) == [(1, "10.60.43.254", ""), (2, None, ""), (3, None, "")]
+
+
+def test_parse_traceroute_unix():
+    assert probes.parse_traceroute(UNIX_TRACEROUTE) == [(1, "10.60.43.254", ""), (2, None, ""), (3, None, "")]
+
+
+@pytest.mark.parametrize("text", ["", None, "traceroute to x, 5 hops max, 60 byte packets\n", "跟踪完成。"])
+def test_parse_traceroute_garbage_is_empty(text):
+    """解析不出来就返回空列表 —— 不猜、不编，由调用方退回「没拿到可解析的跳」。"""
+    assert probes.parse_traceroute(text) == []
+
+
+def test_parse_traceroute_keeps_first_address_for_duplicate_hop():
+    """同一跳被拆成多行（等价多路径）时留第一次出现的地址，不把跳数搞乱。"""
+    text = " 3  * \n 3  10.0.0.7  1.5 ms\n 4  10.0.0.8  1.6 ms\n"
+    assert probes.parse_traceroute(text) == [(3, "10.0.0.7", ""), (4, "10.0.0.8", "")]
+
+
+def test_parse_traceroute_host_unreachable_is_not_an_answer():
+    """真机抓到的坑：Windows 报「无法访问目标主机」时把**本机地址**印在跳号后面。
+
+    那一行不是「第 1 跳回应了」，是「本机这边就出不去」——不区分的话，
+    运维会照着一句「第 1 跳 10.60.42.62 之后无响应」去查不存在的问题。
+    """
+    assert probes.parse_traceroute(WIN_UNREACH_LOCAL) == [(1, None, probes.NOTE_UNREACH_LOCAL)]
+
+
+def test_parse_traceroute_unreachable_from_a_hop_keeps_its_address():
+    """某一跳明确回「目标不可达」时，地址要留着 —— 包确实到了它，问题在它后面。"""
+    hops = probes.parse_traceroute(WIN_UNREACH_HOP)
+    assert hops[0] == (1, "10.60.43.254", "")
+    assert hops[-1] == (3, "172.16.0.9", probes.NOTE_UNREACH_HOP)
+
+
+def test_summarize_all_timeout_blames_local_network():
+    """一跳都没回：先说本机到网关这段不通，别急着怀疑运营商。"""
+    s = probes.summarize_traceroute([(1, None, ""), (2, None, ""), (3, None, "")], "192.0.2.1")
+    assert "前 3 跳全部无响应" in s and "本机" in s
+
+
+def test_summarize_reached_target_means_link_is_fine():
+    """最后一跳就是目标 → 链路是通的，是它自己不回 ICMP（禁 ping / 防火墙）。"""
+    s = probes.summarize_traceroute([(1, "10.60.43.254", ""), (2, "192.0.2.1", "")], "192.0.2.1")
+    assert "已到目标" in s and "链路是通的" in s
+    # 别说成「它不回 ICMP」：触发诊断的可能是 TCP/HTTP 挂了，ICMP 说不定好好的
+    assert "ICMP" not in s.split("→")[1]
+
+
+def test_summarize_private_hop_says_lan():
+    s = probes.summarize_traceroute(probes.parse_traceroute(UNIX_TRACEROUTE), "192.0.2.1")
+    assert "第 1 跳 10.60.43.254 之后无响应" in s
+    assert "内网" in s and "公网" not in s
+
+
+def test_summarize_public_hop_says_isp_side():
+    """最后一跳是公网地址 → 已经出了内网，问题在宽带线路/目标侧。"""
+    s = probes.summarize_traceroute([(1, "192.168.1.1", ""), (2, "202.96.128.86", ""), (3, None, "")], "8.8.4.4")
+    assert "第 2 跳 202.96.128.86" in s and "公网" in s
+
+
+def test_summarize_empty_is_honest():
+    assert "没拿到可解析的跳" in probes.summarize_traceroute([])
+
+
+def test_summarize_host_unreachable_blames_local_side():
+    """本机这边出不去：措辞要拦住「去查远端」这个错误方向。"""
+    s = probes.summarize_traceroute(probes.parse_traceroute(WIN_UNREACH_LOCAL), "10.60.43.250")
+    assert "本机这边没出去" in s and "先查本机网络" in s
+    assert "跳之后无响应" not in s
+
+
+def test_summarize_own_address_as_the_hop_means_local_side():
+    """同一份输出，知道「10.60.42.62 就是本机」才能得出正确结论。
+
+    这是真机抓的：Windows 报「无法访问目标主机」时把自己的地址印在第 1 跳，
+    如果不比对本机地址，就会说成「过了第 1 跳才不通」——方向全反。
+    """
+    hops = [(1, "10.60.42.62", probes.NOTE_UNREACH_HOP)]
+    s = probes.summarize_traceroute(hops, "10.60.43.250", local_ip="10.60.42.62")
+    assert "本机这边没出去" in s and "先查本机网络" in s
+    # 不知道本机地址时，只能保守地说「过了它才不通」，但绝不能说成「本机出不去」
+    s2 = probes.summarize_traceroute(hops, "10.60.43.250")
+    assert "再往后不通" in s2
+
+
+def test_local_addr_for_returns_empty_when_no_route(monkeypatch):
+    """选不出接口（没路由）时返回空串，让调用方退回保守说法，而不是抛异常。"""
+    def boom(*a, **kw):
+        raise OSError("no route")
+    monkeypatch.setattr(probes.socket, "socket", boom)
+    assert probes.local_addr_for("192.0.2.1") == ""
+
+
+def test_probe_traceroute_budget_covers_three_probes_per_hop(monkeypatch):
+    """预算要按「每跳 3 个探测包」给 —— 按 1 倍算会把真结论掐成「超时」。"""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["budget"] = kwargs.get("timeout")
+        return _FakeProc(stdout="")
+
+    monkeypatch.setattr(probes.subprocess, "run", fake_run)
+    monkeypatch.setattr(probes, "local_addr_for", lambda host: "")
+    probes.probe_traceroute("192.0.2.1", hops=5, timeout=1)
+    assert seen["budget"] == 5 * 1 * 3 + 5
+
+
+def test_summarize_unreachable_from_a_hop_points_upstream():
+    """某一跳回「目标不可达」：包到得了它，问题在它后面（别去怪目标设备）。"""
+    s = probes.summarize_traceroute(probes.parse_traceroute(WIN_UNREACH_HOP), "192.0.2.1")
+    assert "第 3 跳 172.16.0.9" in s and "再往后不通" in s
+
+
+def test_probe_traceroute_parses_real_output(monkeypatch):
+    monkeypatch.setattr(probes.subprocess, "run", lambda *a, **k: _FakeProc(WIN_TRACERT))
+    res = probes.probe_traceroute("192.0.2.1", hops=5, timeout=1, system="windows")
+    assert res.kind == "traceroute" and res.target == "192.0.2.1"
+    assert "断在内网" in res.detail and "10.60.43.254" in res.detail
+
+
+def test_probe_traceroute_missing_binary_is_reported_not_raised(monkeypatch):
+    """没装 traceroute 的机器上不能把整轮巡检搞崩：退回一行「不可用」。"""
+    def boom(*a, **k):
+        raise FileNotFoundError("traceroute")
+    monkeypatch.setattr(probes.subprocess, "run", boom)
+    res = probes.probe_traceroute("192.0.2.1", system="linux")
+    assert res.ok is False and "不可用" in res.detail
+
+
+def test_probe_traceroute_timeout_is_bounded(monkeypatch):
+    """命令卡住时必须按 hops*timeout+5 秒兜底，不能陪着一起卡。"""
+    def boom(*a, **k):
+        raise probes.subprocess.TimeoutExpired("traceroute", 6)
+    monkeypatch.setattr(probes.subprocess, "run", boom)
+    res = probes.probe_traceroute("192.0.2.1", hops=1, timeout=1, system="linux")
+    # 预算 = 每跳 3 个探测包 × 跳数 × 每跳秒数 + 5s（tracert 每跳发 3 个，按 1 倍算会掐掉真结论）
+    assert res.ok is False and "超时" in res.detail and ">8s" in res.detail
+
+
+def test_probe_traceroute_unparsable_output_is_not_ok(monkeypatch):
+    """输出解析不了：ok=False（这次诊断没结论），但明细不编内容。"""
+    monkeypatch.setattr(probes.subprocess, "run", lambda *a, **k: _FakeProc("乱码一堆\n"))
+    res = probes.probe_traceroute("192.0.2.1", system="windows")
+    assert res.ok is False and "没拿到可解析的跳" in res.detail

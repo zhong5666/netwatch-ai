@@ -47,6 +47,11 @@ check:
   http_timeout: 3      # HTTP 请求超时(秒)
   dns_timeout: 5       # DNS 解析超时(秒)；标准库 getaddrinfo 没有超时参数，这里靠线程兜底
   down_threshold: 2    # 连续 N 轮离线才判定为「异常」（抗网络抖动）
+  # 补跑 traceroute：设备判定异常后，额外探一次「断在第几跳」（报告明细里会多一句）
+  # auto=开（默认，正常设备零开销）/ false=关
+  traceroute: auto
+  traceroute_hops: 5     # 最多探几跳
+  traceroute_timeout: 1  # 每跳等几秒（Windows 内部换算成毫秒）
 
 # ---------------- AI 分析（可选）----------------
 ai:

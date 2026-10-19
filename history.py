@@ -59,7 +59,10 @@ def record(conn: sqlite3.Connection, data: dict, ts: str) -> int:
     rows = []
     for r in data.get("results") or []:
         items = r.get("checks") or []
-        ms = max([int(i.get("ms") or 0) for i in items], default=0) or None
+        # 「平均探测」只算设备本身的探测项：traceroute 以秒计（按需诊断），
+        # 混进来会把延迟口径整个带偏（几秒 vs 几毫秒）
+        ms_items = [int(i.get("ms") or 0) for i in items if i.get("kind") != "traceroute"]
+        ms = max(ms_items, default=0) or None
         rows.append((
             ts, r["name"], r["ip"], 1 if r["ok"] else 0, int(r["streak"]),
             ms, r.get("detail"), json.dumps(items, ensure_ascii=False),
