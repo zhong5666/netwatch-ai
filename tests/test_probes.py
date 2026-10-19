@@ -26,6 +26,9 @@ import probes
     (["tcp: 22"], ["tcp:22"]),              # 容忍空格
     (["ICMP", "tcp:5000", "http://h/x"], ["icmp", "tcp:5000", "http://h/x"]),
     (["https://h/p"], ["https://h/p"]),
+    (["dns:example.com"], ["dns:example.com"]),
+    (["DNS:Example.COM"], ["dns:Example.COM"]),   # 前缀大小写不敏感，域名原样保留
+    (["dns: example.com"], ["dns:example.com"]),  # 容忍空格
 ])
 def test_parse_checks_ok(raw, expected):
     assert probes.parse_checks(raw) == expected
@@ -39,6 +42,9 @@ def test_parse_checks_ok(raw, expected):
     ["tcp:abc"],
     {"icmp": True},         # 不是列表
     ["ftp://h"],            # 不支持的协议
+    ["dns:"],               # 域名为空
+    ["dns:a b"],            # 域名里有空格
+    ["dns:a.com/x"],        # 混进了 URL 路径
 ])
 def test_parse_checks_reject(bad):
     with pytest.raises(ValueError):
@@ -206,3 +212,88 @@ def test_run_checks_icmp_disabled_workaround():
         assert "可连" in detail
     finally:
         server.close()
+
+
+# ---------------------------------------------------------------- DNS 解析探测（不碰真 DNS）
+
+def _addr(ip):
+    """拼一条 getaddrinfo 风格的记录。"""
+    return (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))
+
+
+def test_pick_addrs_dedup_and_order():
+    """同一域名常返回重复/多协议地址：去重且保序，报告里不刷一长串。"""
+    raw = [_addr("1.2.3.4"), _addr("1.2.3.4"), _addr("5.6.7.8"), _addr("1.2.3.4")]
+    assert probes.pick_addrs(raw) == ["1.2.3.4", "5.6.7.8"]
+    assert probes.pick_addrs(None) == []
+    assert probes.pick_addrs([("裸元组",)]) == []          # 结构不对也不能崩
+
+
+def test_probe_dns_ok_shows_ip_and_ms():
+    res = probes.probe_dns("example.com", resolver=lambda host, port: [_addr("93.184.216.34")])
+    assert res.ok is True
+    assert res.kind == "dns" and res.target == "example.com"
+    assert "93.184.216.34" in res.detail and "ms)" in res.detail
+    assert "等" not in res.detail                          # 只有一个地址时不啰嗦
+
+
+def test_probe_dns_ok_multiple_addrs():
+    res = probes.probe_dns("example.com", resolver=lambda host, port: [_addr("1.1.1.1"), _addr("2.2.2.2")])
+    assert res.ok is True
+    assert "1.1.1.1" in res.detail and "等 2 个" in res.detail
+
+
+def test_probe_dns_failure_says_dns_not_unreachable():
+    """关键：DNS 失败必须写成「解析失败」，不能写成「主机不可达」——
+    否则运维会去查设备/线路，而真正坏的是 DNS 服务器。"""
+    def boom(host, port):
+        raise socket.gaierror(11001, "getaddrinfo failed")
+
+    res = probes.probe_dns("nonexistent.invalid", resolver=boom)
+    assert res.ok is False
+    assert "DNS 解析失败" in res.detail
+    assert "不可达" not in res.detail and "超时" not in res.detail
+
+
+def test_probe_dns_timeout_does_not_block():
+    """getaddrinfo 卡住时必须在 timeout 内返回，而不是陪着一起卡。"""
+    import time as _t
+
+    def hang(host, port):
+        _t.sleep(3)
+        return [_addr("1.1.1.1")]
+
+    t0 = _t.perf_counter()
+    res = probes.probe_dns("slow.invalid", timeout=0.2, resolver=hang)
+    elapsed = _t.perf_counter() - t0
+    assert res.ok is False
+    assert "超时" in res.detail and "0.2s" in res.detail
+    assert elapsed < 1.5, "线程超时没生效，主线程被拖住了"
+
+
+def test_probe_dns_empty_answer_is_failure():
+    """解析器返回空列表（有些环境解析 placeholder 域会这样）不能算通。"""
+    res = probes.probe_dns("weird.invalid", resolver=lambda host, port: [])
+    assert res.ok is False and "无结果" in res.detail
+
+
+def test_run_checks_dispatches_dns(monkeypatch):
+    monkeypatch.setattr(probes.socket, "getaddrinfo", lambda host, port: [_addr("10.0.0.9")])
+    ok, detail, items = probes.run_checks("223.5.5.5", ["dns:example.com"], dns_timeout=2)
+    assert ok is True
+    assert items[0].kind == "dns"
+    assert "DNS 解析 example.com → 10.0.0.9" in detail
+
+
+def test_run_checks_dns_failure_hits_device(monkeypatch):
+    """AND 语义：DNS 挂了（哪怕 ICMP 通）这台设备也算异常 —— 配置里写了就是契约。"""
+    monkeypatch.setattr(probes, "probe_icmp",
+                        lambda host, count, timeout: probes.ProbeResult("icmp", host, True, 1, "ICMP 通"))
+
+    def boom(host, port):
+        raise socket.gaierror(11001, "getaddrinfo failed")
+
+    monkeypatch.setattr(probes.socket, "getaddrinfo", boom)
+    ok, detail, _ = probes.run_checks("10.0.0.1", ["icmp", "dns:example.com"], dns_timeout=2)
+    assert ok is False
+    assert "ICMP 通" in detail and "DNS 解析失败" in detail

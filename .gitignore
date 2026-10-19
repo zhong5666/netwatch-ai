@@ -23,6 +23,9 @@ venv/
 # 本地备份
 *.bak
 
+# 演示脚本中间产物（demo/refresh_demo.py 的 raw stdout，重跑即生成）
+demo/_new.txt
+
 # 本地交接笔记（不进公开仓库）
 *.local.md
 

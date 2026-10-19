@@ -107,6 +107,7 @@ def run_check(cfg: dict, state_file, probe=None) -> dict:
     ping_timeout = int(check.get("ping_timeout", probes.PING_TIMEOUT_DEFAULT))
     tcp_timeout = int(check.get("tcp_timeout", probes.TCP_TIMEOUT_DEFAULT))
     http_timeout = int(check.get("http_timeout", probes.HTTP_TIMEOUT_DEFAULT))
+    dns_timeout = int(check.get("dns_timeout", probes.DNS_TIMEOUT_DEFAULT))
     threshold = int(check.get("down_threshold", 2))
     probe = probe or probes.run_checks
 
@@ -121,6 +122,7 @@ def run_check(cfg: dict, state_file, probe=None) -> dict:
             host, checks,
             ping_count=ping_count, ping_timeout=ping_timeout,
             tcp_timeout=tcp_timeout, http_timeout=http_timeout,
+            dns_timeout=dns_timeout,
         )
 
         # 连续离线计数：通了立刻归零，离线就累加，达到阈值才算「异常」

@@ -348,3 +348,63 @@ def test_http400_without_retry_path_raises(monkeypatch):
     with pytest.raises(RuntimeError) as e:
         analyzer.analyze(ABNORMAL, ALL_DEVICES)
     assert "401" in str(e.value)
+
+
+# ---------------------------------------------------------------- DNS 故障的影响面规则（v0.5）
+
+def _dev(name, checks):
+    return {"name": name, "ip": "10.0.0.1", "checks": checks}
+
+
+DNS_BAD = {"kind": "dns", "target": "x.com", "ok": False, "ms": 3, "detail": "DNS 解析失败"}
+ICMP_BAD = {"kind": "icmp", "target": "10.0.0.1", "ok": False, "ms": 1, "detail": "ICMP 不通"}
+OK_DEV = {"name": "fine", "ip": "10.0.0.2", "checks": [{"kind": "icmp", "ok": True}]}
+
+
+def test_dns_failures_uses_structured_checks():
+    devs = [_dev("a", [ICMP_BAD, DNS_BAD]), _dev("b", [DNS_BAD]), _dev("c", [ICMP_BAD])]
+    assert [d["name"] for d in analyzer.dns_failures(devs)] == ["a", "b"]
+
+
+def test_dns_failures_tolerates_missing_checks():
+    """老数据/假探测结果里没有 checks 字段，不能因此崩掉。"""
+    assert analyzer.dns_failures([{"name": "old"}]) == []
+    assert analyzer.dns_failures(None) == []
+
+
+def test_dns_failures_judges_by_kind_not_by_text():
+    """只按 kind/ok 判定：改文案不该改变结论。"""
+    odd = {"kind": "dns", "target": "x", "ok": False, "ms": 1, "detail": "随便写点什么"}
+    assert len(analyzer.dns_failures([_dev("a", [odd])])) == 1
+
+
+def test_rule_hint_blames_dns_when_dns_failures_dominate():
+    devs = [_dev("pc1", [DNS_BAD]), _dev("pc2", [DNS_BAD]), _dev("switch", [ICMP_BAD])]
+    text = analyzer.rule_hint(devs, devs + [OK_DEV])
+    assert "多台设备 DNS 解析失败" in text
+    assert "DNS 服务器" in text and "交换机" in text      # 明确排除「共同上级」这个方向
+    assert "共同上级" not in text
+
+
+def test_rule_hint_single_dns_failure_points_at_resolver():
+    devs = [_dev("pc1", [DNS_BAD])]
+    text = analyzer.rule_hint(devs, devs + [OK_DEV])
+    assert "DNS 解析失败" in text
+    assert "该设备自身" not in text                        # 不是设备坏了，是解析不了
+
+
+def test_rule_hint_total_outage_wins_over_partial_dns():
+    """全部设备都异常时，先怀疑上游 —— 别被「其中几台是 DNS 失败」带偏到 DNS 服务器。"""
+    devs = [_dev("pc1", [DNS_BAD]), _dev("pc2", [DNS_BAD]), _dev("pc3", [ICMP_BAD])]
+    assert "全部设备不可达" in analyzer.rule_hint(devs, devs)
+
+
+def test_rule_hint_non_dns_multi_still_blames_upstream():
+    devs = [_dev("pc1", [ICMP_BAD]), _dev("pc2", [ICMP_BAD])]
+    assert "共同上级" in analyzer.rule_hint(devs, devs + [OK_DEV])
+
+
+def test_dns_fault_type_is_declared_in_prompt():
+    """FAULT_TYPES 和提示词里的枚举必须一致（枚举由 FAULT_TYPES 生成）。"""
+    assert "DNS 解析异常" in analyzer.FAULT_TYPES
+    assert "DNS 解析异常" in analyzer.JSON_INSTRUCTION

@@ -25,6 +25,7 @@ HEADER = """# netwatch-ai 实测输出（真实终端输出，非示意）
 # 配置：demo/config.demo.yaml
 #   localhost        127.0.0.1   本机
 #   local-web        127.0.0.1   多协议探测 ICMP + TCP:8899 + HTTP，服务由 `python -m http.server 8899` 提供
+#   dns-local        127.0.0.1   DNS 解析探测（解析 localhost，离线环境也能复现）
 #   unreachable-demo 192.0.2.1   RFC 5737 保留测试段，永不响应
 #
 # 五个场景连着跑：正常 → 服务挂 → 状态未变化（不重复告警）→ 恢复 → 可用率报告
@@ -54,15 +55,27 @@ def write_sample(body: str) -> None:
 
 
 def pick_scenario(body: str) -> str:
-    """取「服务挂了」那一场（第二次巡检报告）作 README 引用段。"""
+    """取「服务挂了」那一场（第二次巡检报告）作 README 引用段。
+
+    结束位置是**下一场的标题行**（整行 `====`）。别再用「第一行 └ 明细」当结束标记：
+    明细行都带 6 个空格前缀，`startswith("└")` 永远不成立（会直接 StopIteration 崩掉）；
+    就算改成 strip 后再匹配，也会把 AI 卡片截掉 —— README 那段是要带卡片的。
+    """
     lines = body.split("\n")
     heads = [i for i, l in enumerate(lines)
              if l.startswith("=== netwatch-ai 巡检报告")]
     if len(heads) < 2:
         raise SystemExit("演示输出里没找到两份巡检报告，先检查 demo 是否完整跑完")
     start = heads[1]
-    end = next(i for i in range(start, len(lines)) if lines[i].startswith("└"))
-    return "\n".join(lines[start:end + 1])
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].startswith("=" * 10):
+            end = i
+            break
+    block = lines[start:end]
+    while block and not block[-1].strip():
+        block.pop()
+    return "\n".join(block)
 
 
 def sync_readme(block: str) -> None:

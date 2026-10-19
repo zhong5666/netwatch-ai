@@ -23,6 +23,12 @@ devices:
       - tcp:8899
       - http://127.0.0.1:8899/
 
+  - name: dns-local
+    ip: 127.0.0.1
+    note: DNS 解析演示（解析 localhost，不需要外网也能复现）
+    checks:
+      - dns:localhost
+
   - name: unreachable-demo
     ip: 192.0.2.1
     note: RFC5737 保留段，永不响应
@@ -33,6 +39,7 @@ check:
   ping_timeout: 1
   tcp_timeout: 2
   http_timeout: 3
+  dns_timeout: 5
   down_threshold: 1     # 演示用：第一轮就报异常
 
 ai:

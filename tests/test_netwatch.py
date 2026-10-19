@@ -15,8 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def fake_probe_factory(up_hosts):
     """返回一个假探测函数：up_hosts 里的设备在线，其余离线。"""
-    def fake_probe(host, checks, ping_count=0, ping_timeout=0,
-                   tcp_timeout=0, http_timeout=0):
+    # 用 **kwargs 收参数：编排层给探测函数加新参数时（如 dns_timeout），
+    # 假探测函数不用跟着改，否则一加参数就红一片。
+    def fake_probe(host, checks, **kwargs):
         ok = host in up_hosts
         detail = "ICMP 通 (1ms)" if ok else "ICMP 不通 (rc=1)"
         return ok, detail, [probes.ProbeResult("icmp", host, ok, 1, detail)]

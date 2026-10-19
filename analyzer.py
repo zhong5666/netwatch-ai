@@ -64,15 +64,15 @@ def _get_key() -> str:
     )
 
 
-FAULT_TYPES = ("设备宕机", "网络中断", "端口或服务异常", "其他")
+FAULT_TYPES = ("设备宕机", "网络中断", "端口或服务异常", "DNS 解析异常", "其他")
 
 # 结构化字段：fault_type / confidence / impact / reason / first_step
 ANALYSIS_FIELDS = ("fault_type", "confidence", "impact", "reason", "first_step")
 
 JSON_INSTRUCTION = (
     "请只输出一个 JSON 对象（不要 markdown 代码块、不要多余解释），字段固定为：\n"
-    '{"fault_type": "设备宕机|网络中断|端口或服务异常|其他",\n'
-    ' "confidence": 0.0 到 1.0 之间的小数,\n'
+    '{"fault_type": "%s",\n' % "|".join(FAULT_TYPES)      # 枚举由 FAULT_TYPES 生成，避免两处写歪
+    + ' "confidence": 0.0 到 1.0 之间的小数,\n'
     ' "impact": "影响面：哪些设备/业务受影响",\n'
     ' "reason": "最可能的原因，一句话",\n'
     ' "first_step": "第一步该做什么，给一个具体命令或动作"}\n'
@@ -81,16 +81,51 @@ JSON_INSTRUCTION = (
 )
 
 
+def dns_failures(devices: list) -> list:
+    """挑出「栽在 DNS 解析上」的设备。
+
+    只看结构化字段（``checks[].kind == "dns"`` 且该项不 ok），不做字符串匹配 ——
+    改一句文案不该影响判定。结果里没有 checks（老数据/假探测）就当它不是 DNS 故障。
+    """
+    out = []
+    for dev in devices or []:
+        for chk in dev.get("checks") or []:
+            if chk.get("kind") == "dns" and not chk.get("ok"):
+                out.append(dev)
+                break
+    return out
+
+
+def _names(devices: list, limit: int = 3) -> str:
+    """设备名拼成一行，超过 limit 台就用「等 N 台」收尾（报告别被名字撑爆）。"""
+    names = ", ".join(str(d.get("name", "?")) for d in devices[:limit])
+    return names if len(devices) <= limit else "%s 等 %d 台" % (names, len(devices))
+
+
 def rule_hint(abnormal_devices: list, all_results: list) -> str:
     """规则先行：先给出「影响面」的初步判断，再让 AI 补充原因。
 
     这个判断不需要大模型：全网断 vs 单台断，在运维里是两条完全不同的排查路线。
+    优先级（依次判，先命中的说了算）：
+    1. 全部设备异常 → 上游/本机网络（此时"部分设备 DNS 失败"只是表象，别被带偏）
+    2. 异常设备里**多数是 DNS 解析失败** → DNS 服务器，不是交换机
+    3. 单台异常 → 该设备自身（若它正是 DNS 失败，改成指向解析配置）
+    4. 其余多台异常 → 共同上级
     """
     total = len(all_results)
     down = len(abnormal_devices)
+
     if total and down >= total:
         return "规则判断：**全部设备不可达** → 优先怀疑上游/网关/本机网络，而不是逐台查设备。"
+
+    dns_down = dns_failures(abnormal_devices)
+    if down >= 2 and len(dns_down) * 2 > down:      # DNS 失败占异常设备的一半以上才算「扎堆」
+        return ("规则判断：**多台设备 DNS 解析失败**（%s）→ 线路本身多半是通的，"
+                "优先查 DNS 服务器/上游 DNS/本机解析配置，而不是交换机和网线。" % _names(dns_down))
+
     if down == 1:
+        if dns_down:
+            return "规则判断：**这台设备是 DNS 解析失败** → 优先查 DNS 服务器与解析配置（网络其它部分是通的）。"
         return "规则判断：**仅单台设备不可达** → 优先怀疑该设备自身（电源/网线/服务），网络整体是通的。"
     return "规则判断：**多台不可达**（共 %d 台）→ 优先怀疑共同上级（交换机/网关/VLAN）。" % down
 

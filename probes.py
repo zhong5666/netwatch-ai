@@ -25,12 +25,16 @@
       - name: cloud-vm
         ip: 10.0.0.8
         checks: [tcp:22]                                # 云主机常禁 ICMP，直接探端口
+      - name: dns-ok
+        ip: 223.5.5.5
+        checks: [dns:example.com]                       # 抓「网通但 DNS 挂了」
 """
 from __future__ import annotations
 
 import platform
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -40,6 +44,7 @@ PING_COUNT_DEFAULT = 3
 PING_TIMEOUT_DEFAULT = 1     # 秒
 TCP_TIMEOUT_DEFAULT = 2      # 秒
 HTTP_TIMEOUT_DEFAULT = 3     # 秒
+DNS_TIMEOUT_DEFAULT = 5      # 秒；DNS 卡住是最常见的慢性故障，给宽点
 
 
 @dataclass
@@ -175,10 +180,78 @@ def probe_http(url: str, timeout: int = HTTP_TIMEOUT_DEFAULT) -> ProbeResult:
         return ProbeResult("http", url, False, ms, "HTTP 连不上 (%s)" % _short(e))
 
 
+def _fmt_secs(v) -> str:
+    """把秒数渲染得好看：5 → "5"、0.2 → "0.2"。"""
+    return "%g" % v
+
+
+def resolve_with_timeout(host: str, timeout=DNS_TIMEOUT_DEFAULT, resolver=None):
+    """在线程里跑 getaddrinfo 并加超时。
+
+    标准库的 ``socket.getaddrinfo`` **没有 timeout 参数**：DNS 服务器不应答时
+    Windows 上能卡几十秒，足以把整轮巡检拖住。所以丢进 daemon 线程，
+    主线程只等 ``timeout`` 秒；超时后不再等它（daemon 不会阻止进程退出）。
+
+    ``resolver`` 只为单测预留（注入假解析器，测试不碰真 DNS）。
+    返回 ``(addrinfo 列表, None)`` 或 ``(None, 异常 / "timeout")``。
+    """
+    box: dict = {}
+    lookup = resolver or socket.getaddrinfo
+
+    def work():
+        try:
+            box["addrs"] = lookup(host, None)
+        except BaseException as e:          # gaierror / UnicodeError / 系统级异常都算解析失败
+            box["err"] = e
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    if "err" in box:
+        return None, box["err"]
+    if "addrs" not in box:
+        return None, "timeout"
+    return box["addrs"], None
+
+
+def pick_addrs(addrinfo) -> list:
+    """从 getaddrinfo 结果里取出真实 IP（去重且保序）。"""
+    ips = []
+    for item in addrinfo or []:
+        try:
+            ip = item[4][0]
+        except (IndexError, TypeError):
+            continue
+        if ip and ip not in ips:
+            ips.append(ip)
+    return ips
+
+
+def probe_dns(name: str, timeout=DNS_TIMEOUT_DEFAULT, resolver=None) -> ProbeResult:
+    """DNS 解析探测：域名能否解析成 IP，以及花了多久。
+
+    抓的是「网能通、但 DNS 挂了」这类故障 —— 只 ping 网关根本发现不了。
+    解析失败即判该项失败（配置里写了就是契约），但明细必须写清是**解析失败**，
+    不能写成「主机不可达」，否则会把 DNS 问题误诊成设备问题。
+    """
+    t0 = time.perf_counter()
+    addrs, err = resolve_with_timeout(name, timeout, resolver)
+    ms = int((time.perf_counter() - t0) * 1000)
+    if err == "timeout":
+        return ProbeResult("dns", name, False, ms, "DNS 解析超时 (>%ss)" % _fmt_secs(timeout))
+    if err is not None:
+        return ProbeResult("dns", name, False, ms, "DNS 解析失败 (%s)" % _short(err))
+    ips = pick_addrs(addrs)
+    if not ips:
+        return ProbeResult("dns", name, False, ms, "DNS 解析无结果 (返回 0 个地址)")
+    more = "" if len(ips) == 1 else " 等 %d 个" % len(ips)
+    return ProbeResult("dns", name, True, ms, "DNS 解析 %s → %s%s (%dms)" % (name, ips[0], more, ms))
+
+
 def parse_checks(raw) -> list:
     """把配置里的 checks 规范化成探测指令列表（纯函数）。
 
-    合法写法：``icmp`` / ``tcp:22`` / ``http://host:port/path`` / ``https://...``
+    合法写法：``icmp`` / ``tcp:22`` / ``dns:example.com`` / ``http://host:port/path`` / ``https://...``
     不写（None 或空）→ 默认 ``["icmp"]``；写错直接抛 ValueError，让配置问题当场暴露。
     """
     if raw is None or raw == "" or raw == []:
@@ -199,10 +272,15 @@ def parse_checks(raw) -> list:
             if not port_text.isdigit() or not (1 <= int(port_text) <= 65535):
                 raise ValueError("checks 里的 TCP 端口不合法: %r（应为 1-65535）" % s)
             out.append("tcp:%d" % int(port_text))
+        elif low.startswith("dns:"):
+            name = s.split(":", 1)[1].strip()
+            if not name or any(c.isspace() for c in name) or "/" in name:
+                raise ValueError("checks 里的 DNS 域名不合法: %r（形如 dns:example.com）" % s)
+            out.append("dns:" + name)
         elif low.startswith("http://") or low.startswith("https://"):
             out.append(s)
         else:
-            raise ValueError("不认识的 check: %r（支持 icmp / tcp:PORT / http(s)://…）" % s)
+            raise ValueError("不认识的 check: %r（支持 icmp / tcp:PORT / dns:HOST / http(s)://…）" % s)
     return out
 
 
@@ -216,7 +294,8 @@ def run_checks(host: str,
                ping_count: int = PING_COUNT_DEFAULT,
                ping_timeout: int = PING_TIMEOUT_DEFAULT,
                tcp_timeout: int = TCP_TIMEOUT_DEFAULT,
-               http_timeout: int = HTTP_TIMEOUT_DEFAULT):
+               http_timeout: int = HTTP_TIMEOUT_DEFAULT,
+               dns_timeout: int = DNS_TIMEOUT_DEFAULT):
     """执行一台设备的全部探测。
 
     返回 ``(是否在线, detail 汇总, [ProbeResult, ...])``。
@@ -230,6 +309,8 @@ def run_checks(host: str,
             results.append(probe_icmp(host, ping_count, ping_timeout))
         elif item.startswith("tcp:"):
             results.append(probe_tcp(host, int(item.split(":", 1)[1]), tcp_timeout))
+        elif item.startswith("dns:"):
+            results.append(probe_dns(item.split(":", 1)[1], dns_timeout))
         else:
             results.append(probe_http(item, http_timeout))
 

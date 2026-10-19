@@ -64,20 +64,25 @@
   <text x="514" y="118" fill="#e2e8f0" font-size="12">probes.py</text>
   <text x="514" y="136" fill="#67e8f9" font-size="9">探测层（跨平台）</text>
 
-  <rect x="514" y="150" width="222" height="34" rx="5" fill="#0f172a"/>
-  <rect x="514" y="150" width="222" height="34" rx="5" fill="rgba(8,51,68,0.45)" stroke="#0e7490" stroke-width="1"/>
-  <text x="526" y="165" fill="#e2e8f0" font-size="10">ICMP ping</text>
-  <text x="526" y="178" fill="#94a3b8" font-size="8">只看 returncode（见踩坑 1）</text>
+  <rect x="514" y="148" width="222" height="30" rx="5" fill="#0f172a"/>
+  <rect x="514" y="148" width="222" height="30" rx="5" fill="rgba(8,51,68,0.45)" stroke="#0e7490" stroke-width="1"/>
+  <text x="526" y="162" fill="#e2e8f0" font-size="10">ICMP ping</text>
+  <text x="526" y="174" fill="#94a3b8" font-size="8">只看 returncode（见踩坑 1）</text>
 
-  <rect x="514" y="190" width="222" height="34" rx="5" fill="#0f172a"/>
-  <rect x="514" y="190" width="222" height="34" rx="5" fill="rgba(8,51,68,0.45)" stroke="#0e7490" stroke-width="1"/>
-  <text x="526" y="205" fill="#e2e8f0" font-size="10">TCP 端口</text>
-  <text x="526" y="218" fill="#94a3b8" font-size="8">绕开禁 ICMP 的设备</text>
+  <rect x="514" y="182" width="222" height="30" rx="5" fill="#0f172a"/>
+  <rect x="514" y="182" width="222" height="30" rx="5" fill="rgba(8,51,68,0.45)" stroke="#0e7490" stroke-width="1"/>
+  <text x="526" y="196" fill="#e2e8f0" font-size="10">TCP 端口</text>
+  <text x="526" y="208" fill="#94a3b8" font-size="8">绕开禁 ICMP 的设备</text>
 
-  <rect x="514" y="230" width="222" height="34" rx="5" fill="#0f172a"/>
-  <rect x="514" y="230" width="222" height="34" rx="5" fill="rgba(8,51,68,0.45)" stroke="#0e7490" stroke-width="1"/>
-  <text x="526" y="245" fill="#e2e8f0" font-size="10">HTTP 健康检查</text>
-  <text x="526" y="258" fill="#94a3b8" font-size="8">4xx 算在线，5xx 算异常</text>
+  <rect x="514" y="216" width="222" height="30" rx="5" fill="#0f172a"/>
+  <rect x="514" y="216" width="222" height="30" rx="5" fill="rgba(8,51,68,0.45)" stroke="#0e7490" stroke-width="1"/>
+  <text x="526" y="230" fill="#e2e8f0" font-size="10">HTTP 健康检查</text>
+  <text x="526" y="242" fill="#94a3b8" font-size="8">4xx 算在线，5xx 算异常</text>
+
+  <rect x="514" y="250" width="222" height="30" rx="5" fill="#0f172a"/>
+  <rect x="514" y="250" width="222" height="30" rx="5" fill="rgba(8,51,68,0.45)" stroke="#0e7490" stroke-width="1"/>
+  <text x="526" y="264" fill="#e2e8f0" font-size="10">DNS 解析</text>
+  <text x="526" y="276" fill="#94a3b8" font-size="8">抓「网通但 DNS 挂了」</text>
 
   <!-- C2. .state.yaml -->
   <rect x="500" y="320" width="250" height="70" rx="6" fill="#0f172a"/>
