@@ -334,7 +334,9 @@ def _write_html_report(out_path, db_path, period: str) -> str:
     try:
         if path.parent and not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8", newline="\n")
+        # Path.write_text(newline=...) 是 3.10+ 的签名，项目 floor 是 3.9
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
     except OSError as e:
         return "HTML 报告写入失败：%s" % e
     return "HTML 报告已写入 %s（静态文件，双击即看，无需服务）" % path

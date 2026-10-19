@@ -306,7 +306,10 @@ def main(argv=None) -> int:
     path = Path(args.out)
     if path.parent and not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(html_text, encoding="utf-8", newline="\n")
+    # Path.write_text(newline=...) 是 3.10+ 才有的参数，项目 floor 是 3.9，
+    # 所以这里用 open() 显式写 LF（三方 CI 会替你把 3.9 这道坎跑出来）
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(html_text)
     print("HTML 报告已写入 %s（%d 字符，双击即可看，无需服务）" % (path, len(html_text)))
     return 0
 
