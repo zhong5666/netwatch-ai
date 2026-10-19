@@ -6,6 +6,7 @@
     probes.py    探测层（ICMP / TCP / HTTP，跨平台）
     netwatch.py  编排层（设备清单、连续离线计数、告警去重、报告渲染）
     analyzer.py  AI 层（把异常交给大模型判断根因，规则先行）
+    notifiers.py 通知层（把结论推到 webhook 等渠道，插件化，失败不影响巡检）
     history.py   历史层（SQLite 落库，算可用率 / 中断时长 / 延迟趋势）
 
 用法：
@@ -15,6 +16,8 @@
     python netwatch.py --silent-ok                      # 无新变化只输出 [SILENT]（给定时任务用）
     python netwatch.py --alert-on all                   # 每次都告警（默认 change：只在变化时告警）
     python netwatch.py --report 7d                      # 不探测，只看最近 7 天可用率报告
+    python netwatch.py --notify                         # 告警时按配置推送（需 notify.channels）
+    python netwatch.py --test-notify                    # 发一条样例消息，自检通知渠道
 
 退出码：始终为 0（是否异常写在输出里）；定时任务靠 --silent-ok 的 [SILENT] 约定抑制投递。
 """
@@ -41,6 +44,11 @@ try:
     import history
 except ImportError:          # 历史库缺失不影响巡检本身
     history = None
+
+try:
+    import notifiers
+except ImportError:          # 通知层缺失不影响巡检本身（报告照常打印）
+    notifiers = None
 
 DEFAULT_CONFIG = "config.yaml"
 TS_FMT = "%Y-%m-%d %H:%M:%S"
@@ -237,6 +245,51 @@ def _format_changes(data: dict) -> str:
     return "\n      ".join(parts)
 
 
+# ---------------------------------------------------------------- 通知
+
+def _notify_lines(cfg: dict, data: dict, report_text: str, ts: str,
+                  enabled: bool, news: bool) -> list:
+    """把报告推到配置的渠道，返回要打印的结果行（永不抛异常）。
+
+    两道闸门，都是刻意的：
+      * ``enabled``（--notify）：配了渠道也不会自动发，防误推公司群/生产群；
+      * ``news``（本轮有无新异常/恢复）：和告警去重保持同一套判断 ——
+        每 10 分钟一轮的巡检只在真有事时才打扰人，否则渠道会被刷爆。
+    """
+    if notifiers is None:
+        return []
+    try:
+        channels = notifiers.build_notifiers(cfg)
+    except Exception as e:              # 配置写错也要看得见，不能默默不发
+        return ["⚠️ 通知配置有误: %s" % e]
+    if not channels:
+        return []
+    if not enabled:
+        # 只在「本来就有事该通知」的轮次提醒忘了加 --notify，平时不刷屏
+        return ["(已配置 %d 个通知渠道，未加 --notify，本次未推送)" % len(channels)] if news else []
+    if not news:
+        return []
+    msg = notifiers.build_message(data, report_text, ts)
+    return notifiers.send_all(channels, msg)
+
+
+def _run_test_notify(cfg: dict) -> int:
+    """--test-notify：发一条样例消息，验证渠道通不通（不探测、不写历史）。"""
+    try:
+        channels = notifiers.build_notifiers(cfg)
+    except Exception as e:
+        print("⚠️ 通知配置有误: %s" % e)
+        return 0
+    if not channels:
+        print("配置里没有 notify.channels，先加一个渠道再自检，例如：")
+        print("notify:\n  channels:\n    - type: webhook\n      url: https://example.com/hook")
+        return 0
+    print("自检 %d 个通知渠道：" % len(channels))
+    for line in notifiers.send_all(channels, notifiers.sample_message(time.strftime(TS_FMT))):
+        print(line)
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
 
 def main(argv=None) -> int:
@@ -255,6 +308,10 @@ def main(argv=None) -> int:
                         help="不探测，只看历史可用率报告，如 --report 7d")
     parser.add_argument("--no-history", action="store_true",
                         help="本轮不写历史库")
+    parser.add_argument("--notify", action="store_true",
+                        help="告警时按 notify.channels 推送（安全默认：不加就不推）")
+    parser.add_argument("--test-notify", action="store_true",
+                        help="不探测，只发一条样例消息自检通知渠道")
     args = parser.parse_args(argv)
 
     cfg_path = Path(args.config)
@@ -264,6 +321,13 @@ def main(argv=None) -> int:
         return 0
 
     cfg = load_config(cfg_path)
+
+    # ---- 通知自检：不探测，只发一条样例到配置里的渠道
+    if args.test_notify:
+        if notifiers is None:
+            print("notifiers.py 不可用，无法自检通知渠道。")
+            return 0
+        return _run_test_notify(cfg)
 
     # ---- 只看历史报告，不探测
     if args.report:
@@ -303,32 +367,43 @@ def main(argv=None) -> int:
         print("[SILENT]")
         return 0
 
-    print(format_report(data, ts))
+    # 先攒成一份完整报告（含影响面 + AI 卡片），再一次性打印 / 推送 ——
+    # 推送出去的正文必须和你在终端看到的**完全一致**，否则出问题没法对账。
+    out = [format_report(data, ts)]
 
     if targets:
         alerting = data["new_alerts"] if args.alert_on == "change" else abnormal
         # 影响面判断是纯规则计算的，免费且比大模型更确定 —— 先规则、后 AI
         # 影响面看的是「当前有多少台不通」（全量），AI 只分析本次新出现的故障（省 token）
         if rule_hint is not None:
-            print("\n🧭 影响面判断:")
-            print(rule_hint(abnormal, data["results"]))
+            out.append("\n🧭 影响面判断:")
+            out.append(rule_hint(abnormal, data["results"]))
 
         if args.ai:
-            print("\n🤖 AI 分析:")
+            out.append("\n🤖 AI 分析:")
             if analyze is None:
-                print("(analyzer 不可用：请确认 analyzer.py 存在)")
+                out.append("(analyzer 不可用：请确认 analyzer.py 存在)")
             else:
                 try:
                     raw = analyze(alerting, data["results"], ts_text=ts)
                     # 结构化优先：模型按约定回 JSON 就渲染卡片；没按约定就退回原文（内容不丢）
                     if parse_analysis is not None and render_card is not None:
-                        print(render_card(parse_analysis(raw)))
+                        out.append(render_card(parse_analysis(raw)))
                     else:
-                        print(raw)
+                        out.append(raw)
                 except Exception as e:      # AI 挂了不能影响巡检结果本身
-                    print("(AI 分析失败: %s)" % e)
+                    out.append("(AI 分析失败: %s)" % e)
     elif abnormal:
-        print("\n(异常设备上一轮已告警过，本次不重复分析。想看全量加 --alert-on all)")
+        out.append("\n(异常设备上一轮已告警过，本次不重复分析。想看全量加 --alert-on all)")
+
+    report_text = "\n".join(out)
+    print(report_text)
+
+    # ---- 推送：只在「本轮确实有新消息」时发（与告警去重同一套判断），
+    #      失败只打印一行 —— 通知挂掉绝不影响巡检结论和退出码
+    news = bool(data["has_news"] or (args.alert_on == "all" and abnormal))
+    for line in _notify_lines(cfg, data, report_text, ts, args.notify, news):
+        print(line)
 
     return 0
 

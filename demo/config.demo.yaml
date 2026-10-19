@@ -37,3 +37,12 @@ check:
 
 ai:
   enabled: true
+
+# 通知渠道（默认注释掉，取消注释即可本地验证推送效果）：
+#   python demo/hook_receiver.py 8898 &                  # 假接收端，落盘到 hook.log
+#   python netwatch.py --config demo/config.demo.yaml --notify
+# notify:
+#   channels:
+#     - type: webhook
+#       url: http://127.0.0.1:8898/hook
+

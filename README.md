@@ -1,6 +1,6 @@
 # netwatch-ai 🛰️
 
-**网络巡检 + AI 告警**：定时巡检局域网设备 → **分层探测**（ICMP / TCP 端口 / HTTP）定位到底哪一层断了 → 规则先判断影响面，AI 再说清根因 → 只在真出事时通知你。
+**网络巡检 + AI 告警**：定时巡检局域网设备 → **分层探测**（ICMP / TCP 端口 / HTTP）定位到底哪一层断了 → 规则先判断影响面，AI 再说清根因 → 只在真出事时通知你（终端打印 + webhook 推送，渠道可插拔）。
 
 [![CI](https://github.com/zhong5666/netwatch-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/zhong5666/netwatch-ai/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
@@ -73,6 +73,7 @@ AI 段是**结构化卡片**：大模型只回 JSON（类型 / 置信度 / 影�
 probes.py     探测层：ICMP / TCP / HTTP，跨平台（Windows/Linux/macOS 参数差异都在这里消化）
 netwatch.py   编排层：设备清单、连续离线计数、阈值判定、告警去重、报告渲染
 analyzer.py   AI 层：规则先判影响面，再让大模型说根因（key 只走环境变量）
+notifiers.py  通知层：把报告推到 webhook 等渠道（插件化，失败不影响巡检）
 history.py    历史层：SQLite 落库（零依赖标准库），算可用率 / 中断时长 / 延迟趋势
 ```
 
@@ -150,6 +151,12 @@ check:
 
 ai:
   enabled: true
+
+notify:                       # 通知渠道（可选；不配就只打印到终端）
+  timeout: 5                  # 单渠道超时(秒)，通知卡住不能拖慢巡检
+  channels:
+    - type: webhook
+      url: https://example.com/netwatch-hook    # 任何收 POST 的网关都行
 ```
 
 | checks 写法 | 含义 |
@@ -170,6 +177,8 @@ ai:
 | `--alert-on change\|all` | `change`（默认）只在状态变化时告警；`all` 每轮异常都告警 |
 | `--report 7d` | 不探测，直接出可用率报告（`7d` / `24h` / `30m`） |
 | `--no-history` | 本轮不写历史库 |
+| `--notify` | 按 `notify.channels` 把报告推到外部渠道（**没这个参数绝不发送**） |
+| `--test-notify` | 不探测，只发一条样例消息，自检通知渠道通不通 |
 | `--once` | 只跑一轮（默认行为，保留以兼容旧命令） |
 
 ## 告警去重与恢复通知
@@ -188,6 +197,52 @@ ai:
 顺带省了 token：只有**新**故障才进 prompt，长期没修的故障不会每轮都调一次模型。去重状态存在 `.state.yaml`（跟配置文件放一起，已被 `.gitignore` 忽略）。
 
 想「每轮都提醒」（故障必须钉到修好为止），加 `--alert-on all`。
+
+## 通知：推到手机 / 群（插件化）
+
+终端里打印只是自娱自乐，**推到人手上**才算告警。配一个渠道就能发：
+
+```yaml
+notify:
+  timeout: 5             # 单个渠道超时(秒)
+  channels:
+    - type: webhook
+      url: https://example.com/netwatch-hook
+```
+
+```bash
+python netwatch.py --config config.yaml --notify         # 真有事的那轮才发
+python netwatch.py --config config.yaml --test-notify    # 自检渠道通不通（不探测、不写历史）
+```
+
+两道闸门是刻意的，都是为了**别误推生产群、别把渠道刷爆**：
+
+| 闸门 | 规则 |
+|---|---|
+| 配了渠道 ≠ 会发 | 必须显式加 `--notify`；配了但忘加、而那轮又真有事，报告末尾会提示一句 |
+| 有事才发 | 复用编排层的告警去重结论：新异常 / 恢复才发，「一直异常」和 `[SILENT]` 轮都不发 |
+
+推送载荷是固定 JSON，任何能收 POST 的网关都能接（自建 / 钉钉中转 / 企业微信代理 / n8n / IFTTT）：
+
+```json
+{"source": "netwatch-ai", "title": "⚠️ netwatch-ai: local-web 异常", "level": "warn",
+ "summary": "⚠️ local-web 新异常 (连续离线 2 次)", "devices": ["local-web"],
+ "text": "<终端里看到的那份完整报告>", "ts": "2026-10-19 11:09:13"}
+```
+
+其中 `text` 和终端输出**逐字一致**（含影响面判断和 AI 卡片），出问题能直接对账。
+
+本地验证不用真渠道，仓库里带了个假接收端：
+
+```bash
+python demo/hook_receiver.py 8898 &                                   # 收到的 JSON 追加到 hook.log
+# 给 demo/config.demo.yaml 取消注释末尾的 notify 段，然后：
+python netwatch.py --config demo/config.demo.yaml --notify            # 看 hook.log 里出现了完整载荷
+```
+
+**通知失败不算巡检失败**：单渠道失败重试 1 次，仍失败只打印一行 `⚠️ 通知失败: …` —— 不影响巡检结论、不影响退出码，也不影响其它渠道。
+
+现在只有 `webhook` 一种渠道（基座）；钉钉、企业微信的签名和消息体结构各不相同，后续各作为一个插件加进来。
 
 ## 历史数据与可用率报告
 
@@ -220,14 +275,14 @@ localhost          127.0.0.1        4   100.0%        0 轮         1017ms
 
 ```bash
 # 每 10 分钟巡检一次：只在状态变化时通知（默认），新故障才调 AI
-*/10 * * * * cd /opt/netwatch-ai && NETWATCH_API_KEY=sk-xxx /usr/bin/python3 netwatch.py --ai --silent-ok
+*/10 * * * * cd /opt/netwatch-ai && NETWATCH_API_KEY=sk-xxx /usr/bin/python3 netwatch.py --ai --silent-ok --notify
 ```
 
 Windows 任务计划（示例，路径改成你自己的）：
 
 ```bat
 schtasks /create /tn netwatch /sc minute /mo 10 ^
-  /tr "C:\netwatch-ai\.venv\Scripts\python.exe C:\netwatch-ai\netwatch.py --ai --silent-ok"
+  /tr "C:\netwatch-ai\.venv\Scripts\python.exe C:\netwatch-ai\netwatch.py --ai --silent-ok --notify"
 ```
 
 `--silent-ok` 是给定时任务用的约定：**没有新变化时只输出 `[SILENT]`**，调度器看到它就不投递消息。
@@ -251,6 +306,8 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 - **历史层只用标准库**：SQLite 单文件、无依赖、无常驻进程 —— 巡检跑完就退，不和用户的游戏抢资源。
 - **AI 只回 JSON，渲染由程序做**：字段固定（类型/置信度/影响面/原因/第一步），缺字段就留空、解析失败退回原文 —— 屏上永远不会因为模型不听话而空白。置信度还做了容错：模型写 `85` 或 `"85%"` 都按百分数理解。
 - **护栏不能自己变成故障源**：强制 JSON、关思考这些字段并非所有中转都认，遇 400 自动去掉重发一次；超时/截断/限流分类报错并给出解法，不会把巡检本身搞挂。
+- **通知层不做第二套判断**：要不要发由编排层的去重结论（`has_news`）决定，通知层只管发 —— 两处各判一次，迟早分叉成「日志说没变化、渠道却收到消息」。
+- **通知失败不算巡检失败**：渠道超时或 5xx 只打印一行，退出码仍是 0 —— 否则「巡检挂了」会变成假警报。
 - **key 只走环境变量**：仓库里永远不出现密钥；`config.yaml` 也被 `.gitignore` 忽略（真实内网 IP 不外泄），只提交 `config.example.yaml`。
 - **测试不碰真实网络**：没有测试会去 ping 真实设备，所以 CI 三平台都能稳定跑。
 
@@ -269,7 +326,7 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q        # 119 个用例，覆盖探测逻辑 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计 / AI 输出解析与卡片渲染 / CLI 行为
+pytest -q        # 134 个用例，覆盖探测逻辑 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计 / AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / CLI 行为
 ```
 
 ## Roadmap
@@ -277,7 +334,7 @@ pytest -q        # 119 个用例，覆盖探测逻辑 / 阈值状态机 / 告警
 - [x] 历史数据落 SQLite：可用率 / 最长中断 / 延迟趋势 + `--report 7d`
 - [x] 恢复通知（down → up 时说一句「中断 X 分钟」）与告警去重
 - [x] 结构化 AI 输出（故障类型 / 置信度 / 影响面 JSON），渲染成告警卡片
-- [ ] 通知渠道抽象成插件（微信 / 钉钉 / 邮件 / webhook）
+- [x] 通知渠道插件化：`notifiers.py` + webhook 渠道（钉钉 / 企业微信待接）
 - [ ] 探测项扩展：SNMP、DNS 解析、traceroute
 - [ ] 轻量 Web 面板（可用率趋势）
 
@@ -288,11 +345,13 @@ netwatch-ai/
 ├── netwatch.py              编排层：巡检主流程 + 告警去重 + 报告
 ├── probes.py                探测层：ICMP / TCP / HTTP
 ├── analyzer.py              AI 层：规则判断 + 大模型分析
+├── notifiers.py             通知层：webhook 插件化推送（失败不影响巡检）
 ├── history.py               历史层：SQLite 落库 + 可用率统计
 ├── config.example.yaml      配置示例（真实 config.yaml 不进仓库）
 ├── demo/
 │   ├── run_demo.py          一键复现下面那份输出（自己起/杀本地服务）
 │   ├── refresh_demo.py      重抓输出并同步 README 引用段（开发用）
+│   ├── hook_receiver.py     本地假 webhook 接收端（验证通知用）
 │   ├── config.demo.yaml     演示配置（本机 + 保留测试段）
 │   └── sample_output.txt    真实跑出来的五个场景输出
 ├── docs/architecture.svg    架构图
