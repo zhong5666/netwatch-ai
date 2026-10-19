@@ -28,9 +28,9 @@ netwatch-ai 把这三层分开探，**每个设备的明细都留在报告里**�
 下面这段来自 `demo/sample_output.txt`（不是示意图，是 `python demo/run_demo.py --ai` 实际跑出来的）：把本地 8899 服务 kill 掉之后再跑一次 ——
 
 ```text
-=== netwatch-ai 巡检报告 2026-10-17 17:17:50 ===
+=== netwatch-ai 巡检报告 2026-10-19 10:28:13 ===
 ✓ localhost          127.0.0.1   在线 (连续离线 0 次)
-      └ ICMP 通 (1015ms)
+      └ ICMP 通 (1026ms)
 ⚠️ local-web          127.0.0.1   离线 (连续离线 1 次)
       └ ICMP 通 (1013ms) | TCP 8899 连不上 (timed out) | HTTP 连不上 (<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>)
 ⚠️ unreachable-demo   192.0.2.1   离线 (连续离线 2 次)
@@ -43,12 +43,19 @@ netwatch-ai 把这三层分开探，**每个设备的明细都留在报告里**�
 规则判断：**多台不可达**（共 2 台）→ 优先怀疑共同上级（交换机/网关/VLAN）。
 
 🤖 AI 分析:
-故障类型：端口或服务异常。
-可能原因：local-web 服务未启动或未监听 8899 端口。
-修复建议第一步：登录 local-web，检查 8899 端口监听状态并启动对应服务。
+🤖 AI 故障卡片
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 类型  : 端口或服务异常                                                                      │
+│ 置信度: 80%                                                                                 │
+│ 影响面: 影响 local-web 上 TCP 8899 及 HTTP 服务，业务不可用                                 │
+│ 原因  : ICMP 通说明主机在线，但 TCP 8899 连接超时且 HTTP 连接被拒绝，服务未监听或进程未运行 │
+│ 第一步: 执行 netstat -ano | findstr :8899 检查端口监听状态                                  │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 注意 `local-web` 那一行：**ICMP 通、TCP/HTTP 不通** —— 一眼就知道是服务挂了而不是设备失联。
+
+AI 段是**结构化卡片**：大模型只回 JSON（类型 / 置信度 / 影响面 / 原因 / 第一步命令），由程序渲染成卡片。解析失败也不丢内容 —— 退回原文渲染，并在卡片上标注「未按 JSON 返回」。
 
 服务恢复后它会主动补一条「恢复通知」（不用你去盯）：
 
@@ -106,6 +113,17 @@ python netwatch.py --config config.yaml --ai
 export NETWATCH_API_BASE=https://api.deepseek.com/v1       # 或你的中转 / 自建网关
 export NETWATCH_MODEL=deepseek-chat
 ```
+
+进阶变量（都有保守默认值，不设也能跑）：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `NETWATCH_NO_THINKING` | 关 | `1` = 请求里带 `enable_thinking=false`，**推理模型必开**（否则思考会把 token 预算烧光、正文永远为空） |
+| `NETWATCH_JSON_MODE` | 开 | 带 `response_format={"type":"json_object"}` 强制模型回 JSON；中转若回 400 会自动降级重发 |
+| `NETWATCH_MAX_TOKENS` | `2000` | 单次分析的最大输出 token |
+| `NETWATCH_TIMEOUT` | `60` | 单次分析超时（秒），网络慢的中转可以再放大 |
+
+> 推理模型（deepseek-v4 系列）用 `NETWATCH_NO_THINKING=1`；普通对话模型不用管这些开关。
 
 ## 配置说明
 
@@ -231,6 +249,8 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 - **规则先行，AI 补充**：全网断 vs 单台断是两条完全不同的排查路线，用确定性规则判断比让大模型猜更可靠；AI 只负责讲清原因和第一步。影响面规则看**当前全量**异常（判断面），AI 只看**新**故障（省 token）。
 - **AI 挂了不影响巡检**：AI 调用失败只打印一行提示，巡检结果本身照常输出。
 - **历史层只用标准库**：SQLite 单文件、无依赖、无常驻进程 —— 巡检跑完就退，不和用户的游戏抢资源。
+- **AI 只回 JSON，渲染由程序做**：字段固定（类型/置信度/影响面/原因/第一步），缺字段就留空、解析失败退回原文 —— 屏上永远不会因为模型不听话而空白。置信度还做了容错：模型写 `85` 或 `"85%"` 都按百分数理解。
+- **护栏不能自己变成故障源**：强制 JSON、关思考这些字段并非所有中转都认，遇 400 自动去掉重发一次；超时/截断/限流分类报错并给出解法，不会把巡检本身搞挂。
 - **key 只走环境变量**：仓库里永远不出现密钥；`config.yaml` 也被 `.gitignore` 忽略（真实内网 IP 不外泄），只提交 `config.example.yaml`。
 - **测试不碰真实网络**：没有测试会去 ping 真实设备，所以 CI 三平台都能稳定跑。
 
@@ -241,20 +261,22 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 3. **跨平台 ping 参数不通用**：Windows `-n/-w(毫秒)`、Linux `-c/-W(秒)`、macOS `-c/-W(毫秒)`。所以才有 `build_ping_cmd()` 这个纯函数。
 4. **很多设备默认拒绝 ICMP**（云主机、带防火墙的交换机）。只 ping 会一直误报，必须能降级到 TCP 端口探测。
 5. **状态文件跟着配置文件走**：否则用演示配置跑一次就会污染真实巡检的连续离线计数。
-6. **AI 接口被限流时会返回 200 但内容为空**：静默吞掉会让人以为"没故障"，所以显式报错。
+6. **AI 接口可能返回 200 但内容为空**（限流、或下面的推理模型问题）：静默吞掉会让人以为"没故障"，所以显式报错，并把 `finish_reason` 一起打出来。
+7. **推理模型会把 token 预算全烧在思考上**：`deepseek-v4` 系列把预算花在 reasoning 上，`finish_reason=length`、正文永远为空 —— 预算从 300 加到 4000 都治不了。实测有效组合是 `enable_thinking=false` + `response_format={"type":"json_object"}` **同时**开；只关思考会被真实 prompt 无视（reasoning=1941 token，照样空）。
+8. **强制 JSON 不能变成故障源**：中转对 `response_format` / `enable_thinking` 这类字段可能回 400，所以遇 400 自动去掉这些字段重发一次，保证巡检不会因为"护栏"挂掉。
 
 ## 测试
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q        # 90 个用例，覆盖探测逻辑 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计 / CLI 行为
+pytest -q        # 119 个用例，覆盖探测逻辑 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计 / AI 输出解析与卡片渲染 / CLI 行为
 ```
 
 ## Roadmap
 
 - [x] 历史数据落 SQLite：可用率 / 最长中断 / 延迟趋势 + `--report 7d`
 - [x] 恢复通知（down → up 时说一句「中断 X 分钟」）与告警去重
-- [ ] 结构化 AI 输出（故障类型 / 置信度 / 影响面 JSON），渲染成告警卡片
+- [x] 结构化 AI 输出（故障类型 / 置信度 / 影响面 JSON），渲染成告警卡片
 - [ ] 通知渠道抽象成插件（微信 / 钉钉 / 邮件 / webhook）
 - [ ] 探测项扩展：SNMP、DNS 解析、traceroute
 - [ ] 轻量 Web 面板（可用率趋势）
@@ -270,6 +292,7 @@ netwatch-ai/
 ├── config.example.yaml      配置示例（真实 config.yaml 不进仓库）
 ├── demo/
 │   ├── run_demo.py          一键复现下面那份输出（自己起/杀本地服务）
+│   ├── refresh_demo.py      重抓输出并同步 README 引用段（开发用）
 │   ├── config.demo.yaml     演示配置（本机 + 保留测试段）
 │   └── sample_output.txt    真实跑出来的五个场景输出
 ├── docs/architecture.svg    架构图
