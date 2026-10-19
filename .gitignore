@@ -26,6 +26,9 @@ venv/
 # 演示脚本中间产物（demo/refresh_demo.py 的 raw stdout，重跑即生成）
 demo/_new.txt
 
+# 本机脚本（含本机取 key / 路径逻辑），不进公开仓库
+*.local.py
+
 # 本地交接笔记（不进公开仓库）
 *.local.md
 
