@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import time
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -50,7 +51,13 @@ try:
 except ImportError:          # 通知层缺失不影响巡检本身（报告照常打印）
     notifiers = None
 
+try:
+    import report_html
+except ImportError:          # HTML 报告缺失只是少一种输出形态，报告本身照常打印
+    report_html = None
+
 DEFAULT_CONFIG = "config.yaml"
+REVIEW_DEFAULT_PERIOD = "7d"      # --html 单独用时（没给 --report）默认统计范围
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 
@@ -312,6 +319,27 @@ def _run_test_notify(cfg: dict) -> int:
 
 # ---------------------------------------------------------------- 入口
 
+def _write_html_report(out_path, db_path, period: str) -> str:
+    """把可用率报告落成一份静态 HTML，返回要打印的一行说明。
+
+    失败只回一行 —— HTML 只是「另一种看法」，不能反过来把已经打好的报告带崩。
+    """
+    if report_html is None:
+        return "report_html.py 不可用，跳过 HTML 报告。"
+    try:
+        text = report_html.build_html(db_path, period)
+    except (OSError, sqlite3.Error) as e:      # 库被锁 / 损坏 / 没权限
+        return "HTML 报告生成失败：%s" % e
+    path = Path(out_path)
+    try:
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", newline="\n")
+    except OSError as e:
+        return "HTML 报告写入失败：%s" % e
+    return "HTML 报告已写入 %s（静态文件，双击即看，无需服务）" % path
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="netwatch-ai 网络巡检")
     parser.add_argument("--config", default=DEFAULT_CONFIG,
@@ -326,6 +354,9 @@ def main(argv=None) -> int:
                         help="change=只在状态变化时告警（默认，防刷屏）；all=每轮异常都告警")
     parser.add_argument("--report", default=None,
                         help="不探测，只看历史可用率报告，如 --report 7d")
+    parser.add_argument("--html", default=None, metavar="PATH",
+                        help="不探测，把可用率报告另存成自包含 HTML 静态页"
+                             "（如 --html report.html；窗口用 --report 7d 指定，默认 7d）")
     parser.add_argument("--no-history", action="store_true",
                         help="本轮不写历史库")
     parser.add_argument("--notify", action="store_true",
@@ -349,19 +380,28 @@ def main(argv=None) -> int:
             return 0
         return _run_test_notify(cfg)
 
-    # ---- 只看历史报告，不探测
-    if args.report:
+    # ---- 只看历史报告，不探测（--html 顺带落一份静态 HTML，不常驻、不开端口）
+    if args.report or args.html:
         if history is None:
             print("history.py 不可用，无法出可用率报告。")
             return 0
+        period = args.report or REVIEW_DEFAULT_PERIOD
         try:
-            since, until = history.period_bounds(args.report)
+            since, until = history.period_bounds(period)
         except ValueError as e:
             print("时间范围有误：%s" % e)
             return 0
-        with history.open_db(history_path_for(cfg_path, cfg)) as conn:
-            stats = history.availability(conn, since, until)
+        db_path = history_path_for(cfg_path, cfg)
+        try:
+            with history.open_db(db_path) as conn:
+                stats = history.availability(conn, since, until)
+        except (OSError, sqlite3.Error) as e:      # 库被写坏 / 被别的进程锁住
+            print("历史库读取失败：%s" % e)
+            print("（库文件：%s —— 删掉它再跑一轮巡检就会重建）" % db_path)
+            return 0
         print(history.format_history_report(stats, since, until))
+        if args.html:
+            print(_write_html_report(args.html, db_path, period))
         return 0
 
     if not (cfg.get("devices") or []):

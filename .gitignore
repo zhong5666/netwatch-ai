@@ -26,6 +26,9 @@ venv/
 # 演示脚本中间产物（demo/refresh_demo.py 的 raw stdout，重跑即生成）
 demo/_new.txt
 
+# HTML 报告的默认输出（含真实内网 IP；只提交 demo/sample_report.html）
+/report.html
+
 # 本机脚本（含本机取 key / 路径逻辑），不进公开仓库
 *.local.py
 

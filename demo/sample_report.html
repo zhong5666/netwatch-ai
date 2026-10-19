@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>netwatch-ai 可用率报告</title>
+<style>
+:root { color-scheme: light dark; --fg:#1b1f24; --muted:#6b7280; --bg:#ffffff;
+  --card:#f7f8fa; --line:#e5e7eb; --ok:#16a34a; --bad:#dc2626; --warn:#d97706; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6e8eb; --muted:#9aa4b2; --bg:#14171a; --card:#1c2024;
+    --line:#2c3137; --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; } }
+* { box-sizing:border-box; }
+body { margin:0; padding:24px; background:var(--bg); color:var(--fg);
+  font:15px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",Roboto,sans-serif; }
+h1 { font-size:22px; margin:0 0 4px; }
+h2 { font-size:16px; margin:0 0 10px; }
+.sub { color:var(--muted); font-size:13px; margin-bottom:20px; }
+.cards { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:24px; }
+.kpi { background:var(--card); border:1px solid var(--line); border-radius:10px;
+  padding:10px 16px; min-width:110px; }
+.kpi b { display:block; font-size:22px; }
+.kpi span { color:var(--muted); font-size:12px; }
+section { background:var(--card); border:1px solid var(--line); border-radius:10px;
+  padding:16px 18px; margin-bottom:18px; }
+table { width:100%; border-collapse:collapse; font-size:14px; }
+th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }
+th { color:var(--muted); font-weight:600; font-size:12.5px; }
+tr:last-child td { border-bottom:none; }
+td.num { font-variant-numeric:tabular-nums; white-space:nowrap; }
+.badge { padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid; }
+.b-ok { color:var(--ok); border-color:var(--ok); }
+.b-bad { color:var(--bad); border-color:var(--bad); }
+.b-warn { color:var(--warn); border-color:var(--warn); }
+.bar { background:var(--line); border-radius:4px; height:8px; width:130px; overflow:hidden; }
+.bar i { display:block; height:100%; background:var(--ok); }
+.bar i.low { background:var(--bad); }
+.bar i.mid { background:var(--warn); }
+.strip { display:flex; flex-wrap:wrap; gap:2px; margin:8px 0 6px; }
+.strip i { width:6px; height:14px; border-radius:2px; background:var(--ok); }
+.strip i.down { background:var(--bad); }
+.dev-head { display:flex; align-items:baseline; gap:10px; margin-bottom:2px; }
+.dev-head .ip { color:var(--muted); font-size:13px; }
+.hint { color:var(--muted); font-size:13px; margin-top:6px; }
+footer { color:var(--muted); font-size:12.5px; margin-top:22px; }
+code { background:rgba(127,127,127,.14); padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<h1>netwatch-ai 可用率报告</h1>
+<div class="sub">2026-10-12 21:27:00 ~ 2026-10-19 21:27:00 · 生成于 2026-10-19 21:27:00<br>数据源：<code>.history.db</code></div>
+<div class="cards"><div class="kpi"><b>4</b><span>设备</span></div><div class="kpi"><b>2</b><span>可用率 &lt;99%</span></div><div class="kpi"><b>2</b><span>全程在线</span></div><div class="kpi"><b>2</b><span>中断段</span></div></div>
+<section><h2>概览</h2><table><tr><th>设备</th><th>地址</th><th>轮次</th><th>可用率</th><th></th><th>最长中断</th><th>平均探测</th><th>状态</th></tr><tr><td>unreachable-demo</td><td class="num">192.0.2.1</td><td class="num">4</td><td class="num">0.0%</td><td><div class="bar"><i class="low" style="width:0.0%"></i></div></td><td class="num">4 轮 起 10-19 13:24</td><td class="num">2775ms</td><td><span class="badge b-bad">异常</span></td></tr><tr><td>local-web</td><td class="num">127.0.0.1</td><td class="num">4</td><td class="num">50.0%</td><td><div class="bar"><i class="low" style="width:50.0%"></i></div></td><td class="num">2 轮 起 10-19 13:24</td><td class="num">1524ms</td><td><span class="badge b-bad">异常</span></td></tr><tr><td>dns-local</td><td class="num">127.0.0.1</td><td class="num">4</td><td class="num">100.0%</td><td><div class="bar"><i class="" style="width:100.0%"></i></div></td><td class="num">-</td><td class="num">2ms</td><td><span class="badge b-ok">正常</span></td></tr><tr><td>localhost</td><td class="num">127.0.0.1</td><td class="num">4</td><td class="num">100.0%</td><td><div class="bar"><i class="" style="width:100.0%"></i></div></td><td class="num">-</td><td class="num">1021ms</td><td><span class="badge b-ok">正常</span></td></tr></table><div class="hint">⚠️ 可用率低于 99% 的设备 2 台：unreachable-demo(0.0%), local-web(50.0%)</div></section>
+<section><div class="dev-head"><h2>unreachable-demo</h2><span class="ip">192.0.2.1</span><span class="badge b-bad">异常</span></div><div class="sub">可用率 0.0%（在线 0 / 4 轮）· 最长中断 4 轮 起 10-19 13:24</div><div class="strip"><i class="down" title="离线"></i><i class="down" title="离线"></i><i class="down" title="离线"></i><i class="down" title="离线"></i></div><div class="hint">最近 4 轮时序，红块 = 离线</div><table><tr><th>开始</th><th>结束</th><th>持续</th><th>首条明细</th></tr><tr><td class="num">10-19 13:24</td><td class="num">10-19 13:25</td><td class="num">4 轮</td><td>streak=4<br><span class="hint">ICMP 不通 (rc=1)</span></td></tr></table></section><section><div class="dev-head"><h2>local-web</h2><span class="ip">127.0.0.1</span><span class="badge b-bad">异常</span></div><div class="sub">可用率 50.0%（在线 2 / 4 轮）· 最长中断 2 轮 起 10-19 13:24</div><div class="strip"><i class="" title="在线"></i><i class="down" title="离线"></i><i class="down" title="离线"></i><i class="" title="在线"></i></div><div class="hint">最近 4 轮时序，红块 = 离线</div><table><tr><th>开始</th><th>结束</th><th>持续</th><th>首条明细</th></tr><tr><td class="num">10-19 13:24</td><td class="num">10-19 13:25</td><td class="num">2 轮</td><td>streak=2<br><span class="hint">ICMP 通 (1020ms) | TCP 8899 连不上 (timed out) | HTTP 连不上 (&lt;urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。&gt;)</span></td></tr></table></section><section><div class="dev-head"><h2>dns-local</h2><span class="ip">127.0.0.1</span><span class="badge b-ok">正常</span></div><div class="sub">可用率 100.0%（在线 4 / 4 轮）· 最长中断 -</div><div class="strip"><i class="" title="在线"></i><i class="" title="在线"></i><i class="" title="在线"></i><i class="" title="在线"></i></div><div class="hint">最近 4 轮时序，红块 = 离线</div><div class="hint">这段区间内没有中断记录 ✅</div></section><section><div class="dev-head"><h2>localhost</h2><span class="ip">127.0.0.1</span><span class="badge b-ok">正常</span></div><div class="sub">可用率 100.0%（在线 4 / 4 轮）· 最长中断 -</div><div class="strip"><i class="" title="在线"></i><i class="" title="在线"></i><i class="" title="在线"></i><i class="" title="在线"></i></div><div class="hint">最近 4 轮时序，红块 = 离线</div><div class="hint">这段区间内没有中断记录 ✅</div></section>
+<footer>由 netwatch-ai 生成：静态文件，<b>无服务、无外链、不联网</b>；跑完即退，不给本机添任何常驻开销。真实报告含内网地址，公开前先确认。</footer>
+</body>
+</html>
