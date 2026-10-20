@@ -393,8 +393,17 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q        # 254 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / README 引用段同步 / CLI 行为
+pytest -q        # 256 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / README 引用段同步 / py3.9 兼容闸门 / CLI 行为
 ```
+
+本仓库的 Python floor 是 **3.9**（CI 是 Win·macOS·Linux × 3.9/3.11/3.12 九个作业）。本地 venv 通常是 3.11，用了 3.10+ 的 API 会「本地全绿、CI 三个 3.9 作业红」，所以有两道自检：
+
+```bash
+uv run --python 3.9 --with pytest --with PyYAML python -m pytest -q   # 用真实 3.9 跑一遍（uv 会自己下解释器）
+python tools/sync_readme_block.py                                     # README 引用段还没漂移（漂移退出码 1）
+```
+
+`tests/test_py39_floor.py` 是静态闸门：扫全仓库真代码里有没有 `Path.write_text(newline=)`（3.10+）、`zip(strict=)`（3.10+）、`datetime.UTC` / `tomllib`（3.11+），注释和文档里的反面例子不算。
 
 ## Roadmap
 

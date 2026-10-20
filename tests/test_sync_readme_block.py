@@ -62,18 +62,21 @@ python netwatch.py --report 7d
 """
 
 
+def _write(path, text):
+    """py3.9 floor：`Path.write_text(newline=)` 是 3.10+ 签名，CI 三个 py3.9 作业会直接 TypeError。"""
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
 def _make(tmp_path, effect=None, report=None):
     """铺一个假仓库：demo/sample_output.txt + README.md。默认两段都同步好，传参可造漂移。"""
     (tmp_path / "demo").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "demo" / "sample_output.txt").write_text(SRC, encoding="utf-8", newline="\n")
+    _write(tmp_path / "demo" / "sample_output.txt", SRC)
     readme = tmp_path / "README.md"
-    readme.write_text(
-        README_TMPL.format(
-            effect=srb.slice_effect(SRC) if effect is None else effect,
-            report=srb.slice_report(SRC) if report is None else report,
-        ),
-        encoding="utf-8", newline="\n",
-    )
+    _write(readme, README_TMPL.format(
+        effect=srb.slice_effect(SRC) if effect is None else effect,
+        report=srb.slice_report(SRC) if report is None else report,
+    ))
     return readme
 
 
