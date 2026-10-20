@@ -421,7 +421,7 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q        # 301 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则 / SNMP 报文编解码与参照报文比对）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / README 引用段同步 / py3.9 兼容闸门 / CLI 行为
+pytest -q        # 317 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则 / SNMP 报文编解码与参照报文比对）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / README 引用段同步 / 收工自检 / py3.9 兼容闸门 / CLI 行为
 ```
 
 本仓库的 Python floor 是 **3.9**（CI 是 Win·macOS·Linux × 3.9/3.11/3.12 九个作业）。本地 venv 通常是 3.11，用了 3.10+ 的 API 会「本地全绿、CI 三个 3.9 作业红」，所以有两道自检：
@@ -430,6 +430,16 @@ pytest -q        # 301 个用例，覆盖探测逻辑（含 DNS 超时与影响�
 uv run --python 3.9 --with pytest --with PyYAML python -m pytest -q   # 用真实 3.9 跑一遍（uv 会自己下解释器）
 python tools/sync_readme_block.py                                     # README 引用段还没漂移（漂移退出码 1）
 ```
+
+上面三条收工时容易漏其中一条，所以合成了一条命令（全部本地，`--ci` 才联网）：
+
+```bash
+python tools/preflight.py            # README 引用段 + 双版本 pytest + 工作区干净，全通过退出码 0
+python tools/preflight.py --fast     # 跳过测试，只查 README 和工作区（2 秒）
+python tools/preflight.py --ci       # 额外核对「最新 CI 结论」和「远程 HEAD 是否就是本地 HEAD」
+```
+
+它只做三件本该在收工前做的事：README 两段是否还与 `demo/sample_output.txt` 逐字一致、本地 `.venv` 与 py3.9 两个解释器是否都绿、工作区有没有残留的 `.tmp` / `.bak` / 临时 `.db`（`git add -A` 前最该看的就是它们）。缺 `uv`、缺 `gh`、没有 `.venv` 时明确标「跳过」而不算失败 —— 跳过不是通过，只是把它摆在明面上。**跳过项的措辞是刻意的**：没验过的东西不该被说成绿的。
 
 `tests/test_py39_floor.py` 是静态闸门：扫全仓库真代码里有没有 `Path.write_text(newline=)`（3.10+）、`zip(strict=)`（3.10+）、`datetime.UTC` / `tomllib`（3.11+），注释和文档里的反面例子不算。
 
@@ -465,6 +475,7 @@ netwatch-ai/
 │   └── sample_report.html   同一份演示数据落成的静态 HTML 报告
 ├── docs/architecture.svg    架构图
 ├── tools/
+│   ├── preflight.py         开发工具：收工自检（README 同步 + 双版本测试 + 工作区）
 │   └── sync_readme_block.py 开发工具：README 逐字引用段的比对 / 同步
 ├── tests/                   pytest 单测（不依赖外网）
 └── .github/workflows/ci.yml 三平台 CI
