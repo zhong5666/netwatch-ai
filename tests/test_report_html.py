@@ -113,6 +113,24 @@ def test_render_has_no_external_assets(tmp_path):
         assert bad not in html_text, "报告必须自包含且无脚本：%s" % bad
 
 
+def test_table_separates_wall_clock_from_round_trip(tmp_path):
+    """探测耗时是墙钟（ping -n 3 天然 ~1s），平均RTT 才是链路延迟 —— 两列分开，不混成一把尺子。"""
+    db = tmp_path / ".history.db"
+    ts = datetime.now().strftime(history.TS_FMT)
+    with history.open_db(db) as conn:
+        history.record(conn, {"results": [{
+            "name": "dev-a", "ip": "10.0.0.1", "ok": True, "streak": 0,
+            "detail": "ICMP 通 (RTT 6ms)",
+            "checks": [{"kind": "icmp", "target": "10.0.0.1", "ok": True, "ms": 1021,
+                        "detail": "ICMP 通 (RTT 6ms)", "rtt_ms": 6}],
+        }]}, ts)
+    html_text = report_html.build_html(db, "7d")
+    assert "探测耗时" in html_text and "平均RTT" in html_text
+    assert "1021ms" in html_text, "墙钟口径要留在表里"
+    assert ">6ms<" in html_text, "真实 RTT 单独一列"
+    assert "升级前" in html_text, "得说明老记录没有 RTT 口径，否则单样本均值会被当成 200 轮均值"
+
+
 def test_render_counts_segments_and_devices(tmp_path):
     db = tmp_path / ".history.db"
     _seed(db, _window_rows([True, False, False, True, False]))

@@ -6,10 +6,10 @@ import pytest
 import history
 
 
-def row(device="router", ip="10.0.0.1", ok=True, streak=0, ms=10, ts=None):
+def row(device="router", ip="10.0.0.1", ok=True, streak=0, ms=10, ts=None, rtt=1):
     return {"name": device, "ip": ip, "ok": ok, "streak": streak,
             "detail": "ICMP 通 (1ms)" if ok else "ICMP 不通 (rc=1)",
-            "checks": [{"kind": "icmp", "target": ip, "ms": ms}]}
+            "checks": [{"kind": "icmp", "target": ip, "ms": ms, "rtt_ms": rtt}]}
 
 
 def data(*rows):
@@ -63,8 +63,66 @@ def test_ms_is_max_of_checks(tmp_path):
         assert history.availability(conn)[0]["avg_ms"] == 88
 
 
+def test_avg_rtt_is_not_wall_clock(tmp_path):
+    """墙钟（ping -n 3 ≈ 1 秒）和真实往返必须分家，否则「网络好慢」是自吓。"""
+    d = {"name": "router", "ip": "10.0.0.1", "ok": True, "streak": 0, "detail": "ok",
+         "checks": [{"kind": "icmp", "ms": 1021, "rtt_ms": 6},
+                    {"kind": "tcp", "ms": 88, "rtt_ms": 88}]}
+    with history.open_db(tmp_path / "h.db") as conn:
+        history.record(conn, data(d), "2026-10-20 10:00:00")
+        st = history.availability(conn)[0]
+    assert st["avg_ms"] == 1021        # 墙钟：最慢一项（ICMP 含三个包的等待）
+    assert st["avg_rtt_ms"] == 88      # 真实往返：最慢一项的 rtt
+
+
+def test_timeout_has_no_rtt(tmp_path):
+    """超时类失败的耗时是「等超时」，不是延迟 —— 不能进平均 RTT。"""
+    d = {"name": "router", "ip": "10.0.0.1", "ok": False, "streak": 1, "detail": "不通",
+         "checks": [{"kind": "tcp", "ms": 2000, "rtt_ms": None},
+                    {"kind": "icmp", "ms": 2001, "rtt_ms": None}]}
+    with history.open_db(tmp_path / "h.db") as conn:
+        history.record(conn, data(d), "2026-10-20 10:00:00")
+        st = history.availability(conn)[0]
+    assert st["avg_ms"] == 2001
+    assert st["avg_rtt_ms"] is None    # 没量到就是 None，别编一个数
+
+
+def test_traceroute_rtt_is_excluded_too(tmp_path):
+    d = {"name": "nas", "ip": "10.0.0.2", "ok": False, "streak": 3, "detail": "不通",
+         "checks": [{"kind": "icmp", "ms": 12, "rtt_ms": 4},
+                    {"kind": "traceroute", "ms": 5200, "rtt_ms": 5200}]}
+    with history.open_db(tmp_path / "h.db") as conn:
+        history.record(conn, data(d), "2026-10-20 10:00:00")
+        assert history.availability(conn)[0]["avg_rtt_ms"] == 4
+
+
+def test_legacy_db_without_rtt_column_is_migrated(tmp_path):
+    """v0.8 之前建的库没有 rtt_ms 列：升级后必须自动补列，不能一 INSERT 就炸。"""
+    db = tmp_path / "old.db"
+    import sqlite3
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        "CREATE TABLE checks (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,"
+        " device TEXT NOT NULL, ip TEXT, ok INTEGER NOT NULL, streak INTEGER DEFAULT 0,"
+        " ms INTEGER, detail TEXT, items TEXT);")
+    conn.execute("INSERT INTO checks (ts, device, ip, ok, streak, ms) VALUES (?,?,?,?,?,?)",
+                 ("2026-10-19 10:00:00", "router", "10.0.0.1", 1, 0, 1021))
+    conn.commit()
+    conn.close()
+
+    with history.open_db(db) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(checks)")}
+        assert "rtt_ms" in cols
+        # 老行 rtt_ms 为 NULL：算平均时跳过，不当成 0
+        old = history.availability(conn)[0]
+        assert old["avg_ms"] == 1021
+        assert old["avg_rtt_ms"] is None
+        history.record(conn, data(row(ms=9, rtt=3)), "2026-10-20 10:00:00")
+        assert history.availability(conn)[0]["avg_rtt_ms"] == 3
+
+
 def test_traceroute_ms_is_excluded_from_latency(tmp_path):
-    """按需诊断的耗时（秒级）不能混进「平均探测」口径，否则延迟趋势被带偏。"""
+    """按需诊断的耗时（秒级）不能混进「探测耗时」口径，否则延迟趋势被带偏。"""
     d = {"name": "nas", "ip": "10.0.0.2", "ok": False, "streak": 3, "detail": "不通",
          "checks": [{"kind": "icmp", "ms": 12},
                     {"kind": "traceroute", "ms": 5200}]}
@@ -119,6 +177,27 @@ def test_multiple_devices_sorted_by_worst_first(tmp_path):
 
 # ---------------------------------------------------------------- 渲染
 
+def test_format_history_report_shows_both_latency_columns(tmp_path):
+    """两个数一个列头，且带口径说明 —— 不然读者会把墙钟当延迟。"""
+    with history.open_db(tmp_path / "h.db") as conn:
+        history.record(conn, data(row(ms=1021, rtt=6)), "2026-10-20 09:00:00")
+        text = history.format_history_report(
+            history.availability(conn), "2026-10-19 00:00:00", "2026-10-20 12:00:00")
+    assert "探测耗时" in text and "平均RTT" in text
+    assert "1021ms" in text
+    assert "6ms" in text
+    assert "墙钟" in text          # 口径说明必须在报告里，不能只活在 README
+    assert "升级前" in text        # 老记录没有 RTT：说明平均值的样本数不等于总轮次
+
+
+def test_format_history_report_renders_sub_millisecond_rtt(tmp_path):
+    with history.open_db(tmp_path / "h.db") as conn:
+        history.record(conn, data(row(ms=1021, rtt=0)), "2026-10-20 09:00:00")
+        text = history.format_history_report(
+            history.availability(conn), "2026-10-19 00:00:00", "2026-10-20 12:00:00")
+    assert "<1ms" in text           # 本地回环 ping 报「<1ms」，别显示成 0ms
+
+
 def test_format_history_report_table(tmp_path):
     with history.open_db(tmp_path / "h.db") as conn:
         history.record(conn, data(row(device="router", ok=True)), "2026-10-17 09:00:00")
@@ -135,8 +214,8 @@ def test_format_history_report_table(tmp_path):
 def test_format_history_report_all_healthy():
     stats = [{"device": "d", "ip": "10.0.0.1", "total": 10, "ok_count": 10,
               "availability": 100.0, "longest_down": 0, "longest_down_at": None,
-              "avg_ms": 5, "first_ts": "t", "last_ts": "t", "last_ok": True,
-              "last_streak": 0}]
+              "avg_ms": 5, "avg_rtt_ms": 1, "first_ts": "t", "last_ts": "t",
+              "last_ok": True, "last_streak": 0}]
     text = history.format_history_report(stats, "a", "b")
     assert "✅ 所有设备可用率 ≥ 99%" in text
 

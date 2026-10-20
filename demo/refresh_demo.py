@@ -49,8 +49,14 @@ def run_demo(with_ai: bool) -> str:
     return out.strip("\n")
 
 
+def _write(path, text: str) -> None:
+    """显式写 LF。Path.write_text(newline=...) 是 3.10+ 的签名，本项目 floor 是 3.9。"""
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
 def write_sample(body: str) -> None:
-    SAMPLE.write_text(HEADER + body + "\n", encoding="utf-8", newline="\n")
+    _write(SAMPLE, HEADER + body + "\n")
     print("sample_output.txt: %d 行" % (SAMPLE.read_text(encoding="utf-8").count("\n") + 1))
 
 
@@ -88,7 +94,7 @@ def sync_readme(block: str) -> None:
     if text[start:end].strip() == block.strip():
         print("README 效果段已是最新，跳过")
         return
-    README.write_text(text[:start] + block + "\n" + text[end:], encoding="utf-8", newline="\n")
+    _write(README, text[:start] + block + "\n" + text[end:])
     print("README 效果段已同步（%d 行）" % (block.count("\n") + 1))
 
 
@@ -100,7 +106,7 @@ def main() -> int:
             "不带 --ai 会把卡片段清空，README 引用段跟着一起变。"
         )
     body = run_demo(with_ai)
-    NEW.write_text(body + "\n", encoding="utf-8", newline="\n")   # 留档，便于 diff
+    _write(NEW, body + "\n")   # 留档，便于 diff
     write_sample(body)
     sync_readme(pick_scenario(body))
     print("提示：README「效果」段引用的时间戳变了，顺手确认一下那几句说明还成立。")

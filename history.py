@@ -17,6 +17,8 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
+from probes import fmt_rtt      # RTT 显示口径的唯一定义（别在 history/report 里各写一遍）
+
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 SCHEMA = """
@@ -27,20 +29,40 @@ CREATE TABLE IF NOT EXISTS checks (
     ip     TEXT    NOT NULL,
     ok     INTEGER NOT NULL,          -- 1 在线 / 0 离线
     streak INTEGER NOT NULL,          -- 本轮连续离线次数
-    ms     INTEGER,                   -- 本轮最慢单项探测耗时(毫秒)
+    ms     INTEGER,                   -- 本轮最慢单项**墙钟**耗时(毫秒)
+    rtt_ms INTEGER,                   -- 本轮最慢单项**真实往返**耗时(毫秒)；没这个口径的项为 NULL
     detail TEXT,                      -- 分层明细
     items  TEXT                       -- 每项探测的 JSON
 );
 CREATE INDEX IF NOT EXISTS idx_checks_device_ts ON checks (device, ts);
 """
 
+# 老库升级用：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列
+MIGRATIONS = [
+    ("rtt_ms", "ALTER TABLE checks ADD COLUMN rtt_ms INTEGER"),
+]
+
 
 # ---------------------------------------------------------------- 建库 / 写入
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """给 v0.8 之前建的库补新列。
+
+    为什么必须显式补：``CREATE TABLE IF NOT EXISTS`` 对**已存在**的表一行都不动，
+    老库升级后一 INSERT 就报 ``no column named rtt_ms`` —— 用户会以为升级把库写坏了。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(checks)")}
+    for column, ddl in MIGRATIONS:
+        if column not in cols:
+            conn.execute(ddl)
+    conn.commit()
+
 
 def connect(db_path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -59,19 +81,24 @@ def record(conn: sqlite3.Connection, data: dict, ts: str) -> int:
     rows = []
     for r in data.get("results") or []:
         items = r.get("checks") or []
-        # 「平均探测」只算设备本身的探测项：traceroute 以秒计（按需诊断），
+        # 「探测耗时 / 平均RTT」只算设备本身的探测项：traceroute 以秒计（按需诊断），
         # 混进来会把延迟口径整个带偏（几秒 vs 几毫秒）
         ms_items = [int(i.get("ms") or 0) for i in items if i.get("kind") != "traceroute"]
         ms = max(ms_items, default=0) or None
+        # 真实往返：只认探测项自己量到的 rtt_ms（ICMP 解析包 RTT，TCP/HTTP/DNS 取自身耗时）；
+        # 超时类失败没有 RTT 口径，留 NULL，别拿超时值污染「平均RTT」
+        rtts = [int(i["rtt_ms"]) for i in items
+                if i.get("kind") != "traceroute" and i.get("rtt_ms") is not None]
+        rtt = max(rtts) if rtts else None
         rows.append((
             ts, r["name"], r["ip"], 1 if r["ok"] else 0, int(r["streak"]),
-            ms, r.get("detail"), json.dumps(items, ensure_ascii=False),
+            ms, rtt, r.get("detail"), json.dumps(items, ensure_ascii=False),
         ))
     if not rows:
         return 0
     conn.executemany(
-        "INSERT INTO checks (ts, device, ip, ok, streak, ms, detail, items)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        "INSERT INTO checks (ts, device, ip, ok, streak, ms, rtt_ms, detail, items)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     conn.commit()
     return len(rows)
 
@@ -109,7 +136,7 @@ def _parse_ts(value: str) -> datetime | None:
 
 def availability(conn: sqlite3.Connection, since: str | None = None,
                  until: str | None = None) -> list:
-    """按设备统计：可用率、最长连续中断、平均探测耗时。
+    """按设备统计：可用率、最长连续中断、探测耗时（墙钟）与平均RTT（真实往返）。
 
     可用率 = 在线轮次 / 总轮次。连续中断按巡检轮次算（而不是分钟），
     因为巡检间隔由用户的定时任务决定，用轮次才不会误导。
@@ -130,7 +157,8 @@ def availability(conn: sqlite3.Connection, since: str | None = None,
         st = stats.setdefault(row["device"], {
             "device": row["device"], "ip": row["ip"], "total": 0, "ok_count": 0,
             "down_run": 0, "run_start": None, "longest_down": 0, "longest_down_at": None,
-            "ms_sum": 0, "ms_n": 0, "first_ts": row["ts"], "last_ts": None,
+            "ms_sum": 0, "ms_n": 0, "rtt_sum": 0, "rtt_n": 0,
+            "first_ts": row["ts"], "last_ts": None,
             "last_ok": None, "last_streak": 0,
         })
         st["ip"] = row["ip"]
@@ -141,6 +169,9 @@ def availability(conn: sqlite3.Connection, since: str | None = None,
         if row["ms"]:
             st["ms_sum"] += int(row["ms"])
             st["ms_n"] += 1
+        if row["rtt_ms"] is not None:
+            st["rtt_sum"] += int(row["rtt_ms"])
+            st["rtt_n"] += 1
         if row["ok"]:
             st["ok_count"] += 1
             st["down_run"] = 0
@@ -163,6 +194,7 @@ def availability(conn: sqlite3.Connection, since: str | None = None,
             "availability": st["ok_count"] * 100.0 / total,
             "longest_down": st["longest_down"], "longest_down_at": st["longest_down_at"],
             "avg_ms": int(st["ms_sum"] / st["ms_n"]) if st["ms_n"] else None,
+            "avg_rtt_ms": int(st["rtt_sum"] / st["rtt_n"]) if st["rtt_n"] else None,
             "first_ts": st["first_ts"], "last_ts": st["last_ts"],
             "last_ok": st["last_ok"], "last_streak": st["last_streak"],
         })
@@ -183,17 +215,23 @@ def format_history_report(stats: list, since: str, until: str) -> str:
     w_dev = max([len(s["device"]) for s in stats] + [4]) + 2
     w_ip = max([len(s["ip"]) for s in stats] + [4]) + 2
     lines = [head, ""]
-    lines.append("%-*s %-*s %6s %8s %10s %14s" % (
-        w_dev, "设备", w_ip, "地址", "轮次", "可用率", "最长中断", "平均探测"))
-    lines.append("-" * (w_dev + w_ip + 44))
+    lines.append("%-*s %-*s %6s %8s %10s %10s %9s" % (
+        w_dev, "设备", w_ip, "地址", "轮次", "可用率", "最长中断", "探测耗时", "平均RTT"))
+    lines.append("-" * (w_dev + w_ip + 52))
     for s in stats:
         longest = "%d 轮" % s["longest_down"]
         if s["longest_down_at"]:
             longest += " 起%s" % s["longest_down_at"][5:16]
         avg = "%dms" % s["avg_ms"] if s["avg_ms"] else "-"
-        lines.append("%-*s %-*s %6d %7.1f%% %10s %14s" % (
+        lines.append("%-*s %-*s %6d %7.1f%% %10s %10s %9s" % (
             w_dev, s["device"], w_ip, s["ip"], s["total"],
-            s["availability"], longest, avg))
+            s["availability"], longest, avg, fmt_rtt(s["avg_rtt_ms"])))
+
+    # 两个数不是一把尺子，必须在报告里说清，否则「探测耗时 1021ms」会被读成网络很慢
+    lines.append("")
+    lines.append("探测耗时 = 每轮最慢一项探测的墙钟耗时（ICMP 含 ping -n 3 三个包的等待）；")
+    lines.append("平均RTT  = 该项的真实往返（ICMP 取 ping 报的单包 RTT，TCP/HTTP/DNS 取自身耗时）；")
+    lines.append("           只统计量到该口径的轮次，升级前的历史记录没有这个数。")
 
     bad = [s for s in stats if s["availability"] < 99.0]
     lines.append("")

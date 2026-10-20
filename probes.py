@@ -61,8 +61,9 @@ class ProbeResult:
     kind: str      # icmp / tcp / http / dns / traceroute
     target: str    # 探测目标：ip / ip:port / url
     ok: bool
-    ms: int        # 墙钟耗时(毫秒)
+    ms: int        # **墙钟**耗时(毫秒)：整个探测动作花了多久（ICMP 含 ping -n 3 的等待）
     detail: str    # 人类可读的一行结论
+    rtt_ms: int | None = None   # **真实往返**耗时(毫秒)：拿不到这个口径的项为 None
 
     def __str__(self) -> str:
         return self.detail
@@ -105,6 +106,35 @@ def judge_ping(returncode: int, stdout: str = "") -> bool:
     return returncode == 0
 
 
+# ping 输出里的单包往返时间，一处正则吃下四种写法：
+#   中文 Windows「时间=1ms」「时间<1ms」 / 英文 Windows「time=1ms」 / Unix「time=0.045 ms」
+_RTT_RE = re.compile(r"(?:时间|time)\s*([=<])\s*([\d.]+)\s*ms", re.IGNORECASE)
+
+
+def parse_ping_rtt(stdout: str):
+    """从 ping 输出里取出**单包真实 RTT**（毫秒，取各包最大值）。
+
+    为什么必须和 ``ms``（墙钟）分家：``ping -n 3`` 要等三个包回来，墙钟天然 ~1 秒，
+    把它当「网络延迟」看，一条通畅的链路会被显示成 1000ms+（本地回环也“慢”）。
+    真实 RTT 只有几毫秒 —— 报告里两个数分开列，才不会被自己吓到。
+
+    ``时间<1ms`` 与 Unix 的 ``0.045ms`` 都按 0 处理（显示层用 :func:`fmt_rtt` 渲染成 ``<1ms``）。
+    解析不出来（未知本地化措辞 / 异常输出）返回 None —— **宁可显示「-」，也不编一个数**。
+    """
+    best = None
+    for op, value in _RTT_RE.findall(stdout or ""):
+        v = 0.0 if op == "<" else float(value)
+        best = v if best is None else max(best, v)
+    return None if best is None else int(best)
+
+
+def fmt_rtt(rtt_ms) -> str:
+    """RTT 显示口径：0 = 小于 1ms（对应 ping 的「<1ms」），None = 没量到。"""
+    if rtt_ms is None:
+        return "-"
+    return "<1ms" if int(rtt_ms) <= 0 else "%dms" % int(rtt_ms)
+
+
 def _short(exc: BaseException, limit: int = 60) -> str:
     """异常信息压成一行，避免 detail 太长。"""
     text = str(exc).replace("\n", " ").strip()
@@ -136,7 +166,12 @@ def probe_icmp(host: str,
 
     ms = int((time.perf_counter() - t0) * 1000)
     if judge_ping(res.returncode, res.stdout):
-        return ProbeResult("icmp", host, True, ms, "ICMP 通 (%dms)" % ms)
+        rtt = parse_ping_rtt(res.stdout)
+        # 明细写真实 RTT：写墙钟（~1 秒）会让人以为网络很慢
+        text = ("ICMP 通 (RTT %s)" % fmt_rtt(rtt) if rtt is not None
+                else "ICMP 通 (耗时 %dms)" % ms)
+        return ProbeResult("icmp", host, True, ms, text, rtt)
+    # 不通时耗时就等于超时等待，不是 RTT —— 留 None
     return ProbeResult("icmp", host, False, ms, "ICMP 不通 (rc=%d)" % res.returncode)
 
 
@@ -148,7 +183,7 @@ def probe_tcp(host: str, port: int, timeout: int = TCP_TIMEOUT_DEFAULT) -> Probe
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
         ms = int((time.perf_counter() - t0) * 1000)
-        return ProbeResult("tcp", target, True, ms, "TCP %d 可连 (%dms)" % (port, ms))
+        return ProbeResult("tcp", target, True, ms, "TCP %d 可连 (%dms)" % (port, ms), ms)
     except OSError as e:
         ms = int((time.perf_counter() - t0) * 1000)
         return ProbeResult("tcp", target, False, ms, "TCP %d 连不上 (%s)" % (port, _short(e)))
@@ -176,12 +211,13 @@ def probe_http(url: str, timeout: int = HTTP_TIMEOUT_DEFAULT) -> ProbeResult:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             ms = int((time.perf_counter() - t0) * 1000)
             status = int(getattr(resp, "status", 200) or 200)
-            return ProbeResult("http", url, judge_http(status), ms, "HTTP %d (%dms)" % (status, ms))
+            return ProbeResult("http", url, judge_http(status), ms,
+                               "HTTP %d (%dms)" % (status, ms), ms)
     except urllib.error.HTTPError as e:      # 4xx/5xx 会走这个分支
         ms = int((time.perf_counter() - t0) * 1000)
         ok = judge_http(e.code)
         tail = "" if ok else " 服务端异常"
-        return ProbeResult("http", url, ok, ms, "HTTP %d%s" % (e.code, tail))
+        return ProbeResult("http", url, ok, ms, "HTTP %d%s" % (e.code, tail), ms)
     except (urllib.error.URLError, OSError, ValueError) as e:
         ms = int((time.perf_counter() - t0) * 1000)
         return ProbeResult("http", url, False, ms, "HTTP 连不上 (%s)" % _short(e))
@@ -252,7 +288,8 @@ def probe_dns(name: str, timeout=DNS_TIMEOUT_DEFAULT, resolver=None) -> ProbeRes
     if not ips:
         return ProbeResult("dns", name, False, ms, "DNS 解析无结果 (返回 0 个地址)")
     more = "" if len(ips) == 1 else " 等 %d 个" % len(ips)
-    return ProbeResult("dns", name, True, ms, "DNS 解析 %s → %s%s (%dms)" % (name, ips[0], more, ms))
+    return ProbeResult("dns", name, True, ms,
+                       "DNS 解析 %s → %s%s (%dms)" % (name, ips[0], more, ms), ms)
 
 
 # ---------------------------------------------------------------- traceroute（按需诊断）
@@ -417,7 +454,7 @@ def probe_traceroute(host: str,
     """设备判定不通时按需补一次 traceroute，回答「断在第几跳」。
 
     **只在已经判定异常的设备上调用**：正常设备一分钱不花。
-    耗时以秒计（一跳一轮），所以它这一项不进「平均探测」口径 ——
+    耗时以秒计（一跳一轮），所以它这一项不进「探测耗时 / 平均RTT」口径 ——
     ``history.record`` 会跳过 kind=traceroute，免得把一个 5 秒的诊断混进延迟统计里。
     """
     sysname = system or current_system()

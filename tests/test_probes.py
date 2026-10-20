@@ -88,6 +88,88 @@ def test_judge_ping_trusts_returncode_only():
     assert probes.judge_ping(0, "来自 127.0.0.1 的回复: 字节=32 时间<1ms") is True
 
 
+# ---------------------------------------------------------------- RTT 口径（墙钟 vs 真实往返）
+
+@pytest.mark.parametrize("raw,expected", [
+    # 中文 Windows（每个包一行「时间=1ms」）
+    ("来自 127.0.0.1 的回复: 字节=32 时间=1ms TTL=128\r\n"
+     "来自 127.0.0.1 的回复: 字节=32 时间=1ms TTL=128\r\n"
+     "来自 127.0.0.1 的回复: 字节=32 时间=1ms TTL=128\r\n", 1),
+    # 「时间<1ms」= 小于 1ms，按 0 收（显示层再渲染成 <1ms）
+    ("来自 127.0.0.1 的回复: 字节=32 时间<1ms TTL=128\r\n", 0),
+    # 英文 Windows
+    ("Reply from 10.0.0.1: bytes=32 time=23ms TTL=64\r\n", 23),
+    # Unix ping：小数 + 单位前有空格
+    ("64 bytes from 10.0.0.1: icmp_seq=0 ttl=64 time=0.045 ms\n", 0),
+    ("64 bytes from 8.8.8.8: icmp_seq=0 ttl=117 time=12.3 ms\n", 12),
+    # 多包取最大值（与「探测耗时」取最慢项的口径一致）
+    ("时间=2ms\n时间=31ms\n时间=5ms\n", 31),
+    # 解析不出来就返回 None：宁可显示「-」，也不编一个数
+    ("请求超时。\r\n数据包: 已发送 = 4，已接收 = 0\r\n", None),
+    ("", None),
+])
+def test_parse_ping_rtt(raw, expected):
+    assert probes.parse_ping_rtt(raw) == expected
+
+
+@pytest.mark.parametrize("value,text", [
+    (None, "-"), (0, "<1ms"), (1, "1ms"), (6, "6ms"), (2044, "2044ms"),
+])
+def test_fmt_rtt(value, text):
+    assert probes.fmt_rtt(value) == text
+
+
+def test_probe_icmp_detail_shows_rtt_not_wall_clock(monkeypatch):
+    """回归：本机回环以前显示「ICMP 通 (1021ms)」，读起来像网络很慢。"""
+    class Fake:
+        returncode = 0
+        stdout = ("来自 127.0.0.1 的回复: 字节=32 时间=1ms TTL=128\r\n"
+                  "来自 127.0.0.1 的回复: 字节=32 时间=2ms TTL=128\r\n")
+
+    monkeypatch.setattr(probes.subprocess, "run", lambda *a, **k: Fake())
+    r = probes.probe_icmp("127.0.0.1")
+    assert r.ok is True
+    assert r.rtt_ms == 2                 # 取包 RTT 最大值
+    assert r.detail == "ICMP 通 (RTT 2ms)"
+    assert r.ms >= 0                     # 墙钟仍在，报告里单独一列
+
+
+def test_probe_icmp_unparseable_output_keeps_wall_clock(monkeypatch):
+    """未知本地化措辞：不编 RTT，明细退回墙钟说明，rtt_ms 留 None。"""
+    class Fake:
+        returncode = 0
+        stdout = "PING ok (some locale we do not parse)\r\n"
+
+    monkeypatch.setattr(probes.subprocess, "run", lambda *a, **k: Fake())
+    r = probes.probe_icmp("10.0.0.1")
+    assert r.ok is True and r.rtt_ms is None
+    assert r.detail.startswith("ICMP 通 (耗时 ")
+
+
+def test_probe_icmp_failure_has_no_rtt(monkeypatch):
+    """不通时耗时 = 等超时，不是延迟，所以不能算 RTT。"""
+    class Fake:
+        returncode = 1
+        stdout = "请求超时。\r\n"
+
+    monkeypatch.setattr(probes.subprocess, "run", lambda *a, **k: Fake())
+    r = probes.probe_icmp("192.0.2.1")
+    assert r.ok is False and r.rtt_ms is None
+
+
+def test_probe_tcp_ok_has_rtt(local_http):
+    """TCP 是单发单收，自身耗时就是真实往返。"""
+    import re as _re
+    port = int(_re.search(r":(\d+)", local_http).group(1))
+    r = probes.probe_tcp("127.0.0.1", port)
+    assert r.ok is True and r.rtt_ms == r.ms
+
+
+def test_probe_tcp_refused_has_no_rtt():
+    r = probes.probe_tcp("127.0.0.1", 1)     # 1 号端口必然拒绝
+    assert r.ok is False and r.rtt_ms is None
+
+
 # ---------------------------------------------------------------- HTTP 判定
 
 @pytest.mark.parametrize("status,expected", [

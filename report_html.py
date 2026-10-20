@@ -18,6 +18,7 @@ from html import escape
 from pathlib import Path
 
 import history
+from probes import fmt_rtt      # RTT 显示口径的唯一定义（history/report 共用一份）
 
 # 明细太长会把表格拉爆，截断到一行以内（省略号本身也说明「还有下文」）
 DETAIL_MAX = 120
@@ -175,19 +176,26 @@ def _longest(s: dict) -> str:
 
 
 def _summary_table(stats: list) -> str:
+    # 「探测耗时」是墙钟（ICMP 含 ping -n 3 的等待），「平均RTT」才是真实往返 ——
+    # 两列分开，免得 1021ms 被读成"网络很慢"（表格下方有一行口径说明）
     head = ('<tr><th>设备</th><th>地址</th><th>轮次</th><th>可用率</th><th></th>'
-            '<th>最长中断</th><th>平均探测</th><th>状态</th></tr>')
+            '<th>最长中断</th><th>探测耗时</th><th>平均RTT</th><th>状态</th></tr>')
     body = []
     for s in stats:
         avg = "%dms" % s["avg_ms"] if s["avg_ms"] else "-"
+        rtt = fmt_rtt(s.get("avg_rtt_ms"))
         body.append(
             "<tr><td>%s</td><td%s>%s</td><td%s>%d</td><td%s>%s</td><td>%s</td>"
-            "<td%s>%s</td><td%s>%s</td><td>%s</td></tr>" % (
+            "<td%s>%s</td><td%s>%s</td><td%s>%s</td><td>%s</td></tr>" % (
                 escape(str(s["device"])), _NUM, escape(str(s["ip"])),
                 _NUM, s["total"], _NUM, _pct(s["availability"]),
                 _bar(s["availability"]), _NUM, escape(_longest(s)),
-                _NUM, escape(avg), _badge(s["availability"])))
-    return "<table>%s%s</table>" % (head, "".join(body))
+                _NUM, escape(avg), _NUM, escape(rtt), _badge(s["availability"])))
+    note = ('<div class="hint">探测耗时 = 每轮最慢一项的<b>墙钟</b>耗时'
+            '（ICMP 含 ping -n 3 的等待）；平均RTT = <b>真实往返</b>'
+            '（ICMP 取 ping 报的单包 RTT，TCP/HTTP/DNS 取自身耗时）；'
+            '只统计量到该口径的轮次，升级前的历史记录没有这个数。</div>')
+    return "<table>%s%s</table>%s" % (head, "".join(body), note)
 
 
 def _timeline_html(marks: list) -> str:
