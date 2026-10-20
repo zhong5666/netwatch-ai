@@ -73,6 +73,8 @@ AI 段是**结构化卡片**：大模型只回 JSON（类型 / 置信度 / 影�
 
 `demo/sample_output.txt` 里有连着跑的五个场景：正常 → 服务挂 → 状态没变化（**不重复告警**）→ 恢复 → 可用率报告；同一份演示数据落成的静态页在 `demo/sample_report.html`。
 
+README 里逐字引用这份输出的两段（上面「效果」段里的巡检报告、下面「可用率报告」段）是**脚本同步**的：`python tools/sync_readme_block.py` 只比对（有漂移退出码 1），加 `--write` 才写回 —— AI 卡片是 60 列宽的边框，手抄必错列，肉眼还看不出来。
+
 ## 架构
 
 ![架构图](docs/architecture.svg)
@@ -384,14 +386,14 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 7. **推理模型会把 token 预算全烧在思考上**：`deepseek-v4` 系列把预算花在 reasoning 上，`finish_reason=length`、正文永远为空 —— 预算从 300 加到 4000 都治不了。实测有效组合是 `enable_thinking=false` + `response_format={"type":"json_object"}` **同时**开；只关思考会被真实 prompt 无视（reasoning=1941 token，照样空）。
 8. **强制 JSON 不能变成故障源**：中转对 `response_format` / `enable_thinking` 这类字段可能回 400，所以遇 400 自动去掉这些字段重发一次，保证巡检不会因为"护栏"挂掉。
 9. **`socket.getaddrinfo` 没有 timeout 参数**：DNS 服务器不应答时，Windows 上能卡几十秒，整轮巡检一起陪葬。所以 DNS 探测丢进 daemon 线程里跑、主线程只等 `dns_timeout` 秒 —— 超时后不再等它（daemon 不阻止进程退出）。已写成测试 `test_probe_dns_timeout_does_not_block`（要求 0.2 秒超时的探测在 1.5 秒内返回）。
-10. **演示脚本的结束标记不能靠缩进猜**：`refresh_demo.py` 原来用「第一行以 `└` 开头」当报告结束位置，而明细行都有 6 个空格前缀 —— 这个条件永远不成立，脚本直接 `StopIteration` 崩掉；就算改成 `strip()` 后再匹配也会把 AI 卡片截掉。改成「下一场的 `====` 标题行」才对。
+10. **演示脚本的结束标记不能靠缩进猜**：`refresh_demo.py` 原来用「第一行以 `└` 开头」当报告结束位置，而明细行都有 6 个空格前缀 —— 这个条件永远不成立，脚本直接 `StopIteration` 崩掉；就算改成 `strip()` 后再匹配也会把 AI 卡片截掉。改成「下一场的 `====` 标题行」才对。这条规则现在住在 `tools/sync_readme_block.py`（「效果」段与「可用率报告」段共用这一份实现，不再各写一套切块逻辑）。
 11. **端口没清干净会让演示假通过**：`demo/run_demo.py` 的场景二是 kill 掉自己起的 8899 服务，但如果机器上早有个 8899 的监听（比如上次调试留下的 `http.server`），kill 掉自己的子进程后端口照样有人应答 —— 巡检报告显示「服务在线」，README 引用的输出就变成假的。跑演示前先 `netstat -ano | findstr :8899` 确认没人占。
 
 ## 测试
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q        # 247 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / CLI 行为
+pytest -q        # 254 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / README 引用段同步 / CLI 行为
 ```
 
 ## Roadmap
@@ -419,12 +421,14 @@ netwatch-ai/
 ├── config.example.yaml      配置示例（真实 config.yaml 不进仓库）
 ├── demo/
 │   ├── run_demo.py          一键复现下面那份输出（自己起/杀本地服务）
-│   ├── refresh_demo.py      重抓输出并同步 README 引用段（开发用）
+│   ├── refresh_demo.py      重抓输出，再调 tools/ 的同步工具写回 README（开发用）
 │   ├── hook_receiver.py     本地假 webhook 接收端（验证通知用）
 │   ├── config.demo.yaml     演示配置（本机 + 保留测试段）
 │   ├── sample_output.txt    真实跑出来的五个场景输出
 │   └── sample_report.html   同一份演示数据落成的静态 HTML 报告
 ├── docs/architecture.svg    架构图
+├── tools/
+│   └── sync_readme_block.py 开发工具：README 逐字引用段的比对 / 同步
 ├── tests/                   pytest 单测（不依赖外网）
 └── .github/workflows/ci.yml 三平台 CI
 ```

@@ -7,6 +7,9 @@
 为什么用脚本而不是手改：
 1. run_demo.py 的输出是 CRLF，仓库里统一 LF；
 2. README 里逐字引用 sample_output.txt，而 AI 卡片有 60 列宽的边框 —— 手抄必错列。
+
+README 同步规则本身在 tools/sync_readme_block.py（「效果」段与「可用率报告」段都归它管），
+这里只负责重抓输出，然后调它一次 —— 一份实现，不各自漂移。
 """
 import os
 import subprocess
@@ -16,7 +19,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 NEW = ROOT / "demo" / "_new.txt"
 SAMPLE = ROOT / "demo" / "sample_output.txt"
-README = ROOT / "README.md"
+
+sys.path.insert(0, str(ROOT / "tools"))
+import sync_readme_block as srb   # noqa: E402  （路径要先插好再导入）
 
 HEADER = """# netwatch-ai 实测输出（真实终端输出，非示意）
 #
@@ -60,44 +65,6 @@ def write_sample(body: str) -> None:
     print("sample_output.txt: %d 行" % (SAMPLE.read_text(encoding="utf-8").count("\n") + 1))
 
 
-def pick_scenario(body: str) -> str:
-    """取「服务挂了」那一场（第二次巡检报告）作 README 引用段。
-
-    结束位置是**下一场的标题行**（整行 `====`）。别再用「第一行 └ 明细」当结束标记：
-    明细行都带 6 个空格前缀，`startswith("└")` 永远不成立（会直接 StopIteration 崩掉）；
-    就算改成 strip 后再匹配，也会把 AI 卡片截掉 —— README 那段是要带卡片的。
-    """
-    lines = body.split("\n")
-    heads = [i for i, l in enumerate(lines)
-             if l.startswith("=== netwatch-ai 巡检报告")]
-    if len(heads) < 2:
-        raise SystemExit("演示输出里没找到两份巡检报告，先检查 demo 是否完整跑完")
-    start = heads[1]
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        if lines[i].startswith("=" * 10):
-            end = i
-            break
-    block = lines[start:end]
-    while block and not block[-1].strip():
-        block.pop()
-    return "\n".join(block)
-
-
-def sync_readme(block: str) -> None:
-    text = README.read_text(encoding="utf-8")
-    marker = "=== netwatch-ai 巡检报告"
-    # 只替换「效果」段里 fenced code block 中的那份报告
-    fence = text.index("## 效果")
-    start = text.index(marker, fence)
-    end = text.index("```", start)
-    if text[start:end].strip() == block.strip():
-        print("README 效果段已是最新，跳过")
-        return
-    _write(README, text[:start] + block + "\n" + text[end:])
-    print("README 效果段已同步（%d 行）" % (block.count("\n") + 1))
-
-
 def main() -> int:
     with_ai = "--ai" in sys.argv[1:]
     if not with_ai:
@@ -108,7 +75,7 @@ def main() -> int:
     body = run_demo(with_ai)
     _write(NEW, body + "\n")   # 留档，便于 diff
     write_sample(body)
-    sync_readme(pick_scenario(body))
+    srb.main(["--root", str(ROOT), "--write"])
     print("提示：README「效果」段引用的时间戳变了，顺手确认一下那几句说明还成立。")
     return 0
 
