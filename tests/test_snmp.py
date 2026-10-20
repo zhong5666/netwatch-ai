@@ -224,6 +224,41 @@ def test_probe_no_answer_says_snmp_not_host_unreachable():
     assert res.rtt_ms is None
 
 
+
+class _RaisingSock:
+    """把 recv 换成「抛指定异常」，用来锁跨平台异常类差异（不依赖跑测试的机器）。"""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def settimeout(self, _t):
+        pass
+
+    def connect(self, _addr):
+        pass
+
+    def send(self, _pkt):
+        return 0
+
+    def recv(self, _n):
+        raise self._exc
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("exc", [
+    ConnectionResetError(10054, "Connection reset by peer"),    # Windows：ICMP 端口不可达
+    ConnectionRefusedError(111, "Connection refused"),          # Linux / macOS：ECONNREFUSED
+])
+def test_port_unreachable_maps_both_platform_exceptions(monkeypatch, exc):
+    """同一个「161 没服务」，三平台抛的异常类不同 —— 只 catch Reset 会让 Linux 掉进 OSError 兜底。"""
+    monkeypatch.setattr(probes.socket, "socket", lambda *a, **kw: _RaisingSock(exc))
+    res = probes.probe_snmp("127.0.0.1", "sysDescr", timeout=1, port=16161)
+    assert res.ok is False
+    assert "端口不可达" in res.detail
+    assert "不可达" in res.detail and "主机" not in res.detail
+
 def test_probe_drops_stray_response_with_wrong_request_id(fixed_request_id):
     """串包/重发：request-id 对不上的应答要丢掉，不能拿来判「在线」。"""
     port = _free_port()

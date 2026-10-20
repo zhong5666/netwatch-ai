@@ -794,7 +794,11 @@ def probe_snmp(host: str, target, community: str = SNMP_COMMUNITY_DEFAULT,
         ms = int((time.perf_counter() - t0) * 1000)
         return ProbeResult("snmp", target_txt, False, ms,
                            "SNMP 无应答 (>%ss)：设备可能没开 SNMP、团体名不对或被 ACL 拦" % _fmt_secs(timeout))
-    except ConnectionResetError:
+    except ConnectionError:
+        # 同一个「对方 161 没服务」，三个平台报的异常不是一个类：
+        # Windows 收 ICMP 端口不可达 → ConnectionResetError(10054)
+        # Linux / macOS → ConnectionRefusedError(ECONNREFUSED)
+        # 所以必须 catch 共同父类 ConnectionError，只 catch Reset 会让 Linux 掉进下面的 OSError 兜底
         ms = int((time.perf_counter() - t0) * 1000)
         return ProbeResult("snmp", target_txt, False, ms,
                            "SNMP 端口不可达（对端 %d 没有 SNMP 服务，回了 ICMP 拒绝）" % port)

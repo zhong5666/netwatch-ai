@@ -194,7 +194,7 @@ notify:                       # 通知渠道（可选；不配就只打印到终
 
 多个 check 是 **AND** 语义：任意一项失败即判该设备异常，但**明细全部保留**。
 
-**SNMP 只做 v2c 的单点 GET**，够用就行：它抓的是 ICMP 看不出来的事 —— 设备还 ping 得通、但最近重启过（`sysUpTime` 掉回几十秒）、主机名/位置/型号对不上。没有引 pysnmp：v2c 的 GetRequest 一共 40 个字节，编解码自己写（`probes.py` 里 `build_snmp_get` / `parse_snmp_response`），报文结构用 pysnmp 7.1.30 交叉验证过 —— `tests/test_snmp.py` 里的参照字节都是它生成的，我们发的包必须和它**字节级相同**，它造的应答我们必须解得对。
+**SNMP 只做 v2c 的单点 GET**，够用就行：它抓的是 ICMP 看不出来的事 —— 设备还 ping 得通、但最近重启过（`sysUpTime` 掉回几十秒）、主机名/位置/型号对不上。没有引 pysnmp：v2c 的 GetRequest 也就四十来个字节，编解码自己写（`probes.py` 里 `build_snmp_get` / `parse_snmp_response`），报文结构用 pysnmp 7.1.30 交叉验证过 —— `tests/test_snmp.py` 里的参照字节都是它生成的，我们发的包必须和它**字节级相同**，它造的应答我们必须解得对。
 
 四种失败分得清，因为处置完全不同：
 
@@ -412,14 +412,14 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 12. **SNMP 的 Gauge32 / Counter32 是无符号的**：`0xffffffff` 若按有符号整数解会变成 `-1`，网卡流量、接口计数全会显示成负数。按 tag 区分（`0x41`/`0x42`/`0x46` 走无符号）已经写成测试 `test_counter_is_unsigned_not_signed`。
 13. **OID 的前两段是「合成」成一个子标识符的**（`40*第一段+第二段`），而这个合成值同样要按 base-128 变长编码：`2.100.3` 编出来是 `81 34 03`，不是 `b4 03`。一开始按「单字节」写，只对 `1.3.6.x` 这种常见前缀碰巧正确。
 14. **SNMP 团体名是凭据**：明细会流进终端、历史库、HTML 报告和 AI prompt，所以「无应答」的提示里只说「没开 SNMP 或团体名不对」，**永不回显团体名本身**（`test_probe_detail_never_leaks_community`）。
-15. **UDP 的「端口不可达」在 Windows 上是 `ConnectionResetError [WinError 10054]`**：如果只 catch `socket.timeout`，对端 161 没服务时会直接抛异常把整轮巡检打断。要单独 catch 出来，报「SNMP 端口不可达」而不是「主机不可达」。
+15. **「端口不可达」的异常类三个平台不一样**：Windows 收 ICMP 是 `ConnectionResetError [WinError 10054]`，Linux / macOS 是 `ConnectionRefusedError [Errno 111/61]`。只 catch `socket.timeout` 会把整轮巡检打断；只 catch `ConnectionResetError` 则 Windows 绿、CI 的 Linux/macOS 六个作业一起红（**实踩**：`f0cd889` 推送后 CI 6/9）。正确写法是 catch 共同父类 `ConnectionError`，报「SNMP 端口不可达」而不是「主机不可达」，并用假 socket 把两种异常都参数化测一遍（不依赖跑测试的机器）。
 16. **手写协议需要外部参照，不然是「两边一起错」**：我们自己编码、自己解码，写歪了测试也照样绿。所以参照报文由 pysnmp 7.1.30 独立生成并写死进测试（我们发的包必须与它字节级相同，它造的应答我们必须解得对），pysnmp 本身不进依赖、不进 CI。
 
 ## 测试
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q        # 298 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则 / SNMP 报文编解码与参照报文比对）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / README 引用段同步 / py3.9 兼容闸门 / CLI 行为
+pytest -q        # 301 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则 / SNMP 报文编解码与参照报文比对）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / README 引用段同步 / py3.9 兼容闸门 / CLI 行为
 ```
 
 本仓库的 Python floor 是 **3.9**（CI 是 Win·macOS·Linux × 3.9/3.11/3.12 九个作业）。本地 venv 通常是 3.11，用了 3.10+ 的 API 会「本地全绿、CI 三个 3.9 作业红」，所以有两道自检：
