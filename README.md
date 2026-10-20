@@ -415,6 +415,8 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 15. **「端口不可达」的异常类三个平台不一样**：Windows 收 ICMP 是 `ConnectionResetError [WinError 10054]`，Linux / macOS 是 `ConnectionRefusedError [Errno 111/61]`。只 catch `socket.timeout` 会把整轮巡检打断；只 catch `ConnectionResetError` 则 Windows 绿、CI 的 Linux/macOS 六个作业一起红（**实踩**：`f0cd889` 推送后 CI 6/9）。正确写法是 catch 共同父类 `ConnectionError`，报「SNMP 端口不可达」而不是「主机不可达」，并用假 socket 把两种异常都参数化测一遍（不依赖跑测试的机器）。
 16. **手写协议需要外部参照，不然是「两边一起错」**：我们自己编码、自己解码，写歪了测试也照样绿。所以参照报文由 pysnmp 7.1.30 独立生成并写死进测试（我们发的包必须与它字节级相同，它造的应答我们必须解得对），pysnmp 本身不进依赖、不进 CI。
 
+17. **假服务不要「先借端口、再让线程 bind」**：测试里的 UDP 假 agent 一开始是 `_free_port()` 拿号 → `close()` → 线程里再 `bind(port)`。本地 Windows 一直绿，macOS 的 CI runner 上却偶发「端口不可达」——线程还没 bind，探针的包已经发出去了，对方回 ICMP 拒绝，`noSuchInstance` 那个用例就红（`39440978532` 8/9）。改成**主线程同步 bind 已绑好的 socket 再交给线程**（端口让内核给），端口一开始就处于监听状态，窗口为零。
+
 ## 测试
 
 ```bash

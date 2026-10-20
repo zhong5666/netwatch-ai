@@ -53,14 +53,21 @@ def fixed_request_id(monkeypatch):
     monkeypatch.setattr(probes, "_snmp_request_id", lambda: REF_REQUEST_ID)
 
 
-def _serve_once(payload, port):
-    """在 port 上收一个包，回一段固定字节；返回线程（daemon，测试挂了也不拖住进程）。"""
+def _start_agent(payload):
+    """起一个假 agent：**在主线程里 bind**，再把已绑好的 socket 交给线程收包。
+
+    这里踩过坑：先 `_free_port()` 拿号、关闭、再在线程里 bind，会有两个窗口 ——
+    ① 端口可能被别人抢走；② macOS 的 CI runner 上线程还没 bind，探针的包就先发出去了，
+    对方回 ICMP 端口不可达，探针如实报「端口不可达」，测试就红成「noSuchInstance 不在明细里」。
+    所以 bind 必须同步完成（返回时端口已在监听），端口让内核给（bind 0）。
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.settimeout(5)
+    port = srv.getsockname()[1]
 
     def run():
-        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            srv.bind(("127.0.0.1", port))
-            srv.settimeout(5)
             _, peer = srv.recvfrom(4096)
             srv.sendto(payload, peer)
         except OSError:
@@ -70,11 +77,11 @@ def _serve_once(payload, port):
 
     th = threading.Thread(target=run, daemon=True)
     th.start()
-    return th
+    return port, th
 
 
 def _free_port():
-    """先占一个端口再放掉，拿到一个大概率没人用的号（避免和真服务撞车）。"""
+    """拿一个「确定没人监听」的端口：bind 0 拿到号就关掉。只给「期望没人应答」的用例用。"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -179,8 +186,7 @@ def test_non_printable_octet_string_renders_as_hex():
 # ---------------------------------------------------------------- 回环往返（真 socket）
 
 def test_probe_ok_against_reference_response(fixed_request_id):
-    port = _free_port()
-    _serve_once(bytes.fromhex(REF_RSP_STR), port)
+    port, _ = _start_agent(bytes.fromhex(REF_RSP_STR))
     res = probes.probe_snmp("127.0.0.1", "sysDescr", port=port, timeout=3)
     assert res.ok
     assert res.kind == "snmp"
@@ -190,8 +196,7 @@ def test_probe_ok_against_reference_response(fixed_request_id):
 
 def test_probe_detail_never_leaks_community(fixed_request_id):
     """团体名是凭据：明细会进终端报告、历史库和 HTML，绝不能带出来。"""
-    port = _free_port()
-    _serve_once(bytes.fromhex(REF_RSP_STR), port)
+    port, _ = _start_agent(bytes.fromhex(REF_RSP_STR))
     res = probes.probe_snmp("127.0.0.1", "sysDescr", community="s3cr3t-ro",
                             port=port, timeout=3)
     assert "s3cr3t-ro" not in res.detail
@@ -199,16 +204,14 @@ def test_probe_detail_never_leaks_community(fixed_request_id):
 
 
 def test_probe_reports_error_status(fixed_request_id):
-    port = _free_port()
-    _serve_once(bytes.fromhex(REF_RSP_ERR_NOSUCHNAME), port)
+    port, _ = _start_agent(bytes.fromhex(REF_RSP_ERR_NOSUCHNAME))
     res = probes.probe_snmp("127.0.0.1", "sysDescr", port=port, timeout=3)
     assert not res.ok
     assert "noSuchName" in res.detail and "error-index=1" in res.detail
 
 
 def test_probe_reports_missing_oid(fixed_request_id):
-    port = _free_port()
-    _serve_once(bytes.fromhex(REF_RSP_NO_SUCH_INSTANCE), port)
+    port, _ = _start_agent(bytes.fromhex(REF_RSP_NO_SUCH_INSTANCE))
     res = probes.probe_snmp("127.0.0.1", "sysDescr", port=port, timeout=3)
     assert not res.ok
     assert "noSuchInstance" in res.detail
@@ -259,11 +262,11 @@ def test_port_unreachable_maps_both_platform_exceptions(monkeypatch, exc):
     assert "端口不可达" in res.detail
     assert "不可达" in res.detail and "主机" not in res.detail
 
+
 def test_probe_drops_stray_response_with_wrong_request_id(fixed_request_id):
     """串包/重发：request-id 对不上的应答要丢掉，不能拿来判「在线」。"""
-    port = _free_port()
     others = bytes.fromhex(REF_RSP_STR).replace(b"\x02\x02\x2a\x2a", b"\x02\x02\x11\x11")
-    _serve_once(others, port)
+    port, _ = _start_agent(others)
     res = probes.probe_snmp("127.0.0.1", "sysDescr", port=port, timeout=0.4)
     assert not res.ok
 
