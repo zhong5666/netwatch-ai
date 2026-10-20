@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 import sqlite3
 from datetime import datetime
@@ -116,6 +117,11 @@ def run_check(cfg: dict, state_file, probe=None, alert_on: str = "change") -> di
     tcp_timeout = int(check.get("tcp_timeout", probes.TCP_TIMEOUT_DEFAULT))
     http_timeout = int(check.get("http_timeout", probes.HTTP_TIMEOUT_DEFAULT))
     dns_timeout = int(check.get("dns_timeout", probes.DNS_TIMEOUT_DEFAULT))
+    snmp_timeout = int(check.get("snmp_timeout", probes.SNMP_TIMEOUT_DEFAULT))
+    # 团体名是凭据：只从配置/环境变量取，绝不写进报告、历史库或 HTML
+    snmp_community = str(check.get("snmp_community") or
+                         os.environ.get("NETWATCH_SNMP_COMMUNITY") or
+                         probes.SNMP_COMMUNITY_DEFAULT)
     # 设备判定异常后补跑 traceroute：正常设备零开销（traceroute_enabled 的默认值是开）
     traceroute_on = probes.traceroute_enabled(check.get("traceroute"))
     traceroute_hops = int(check.get("traceroute_hops", probes.TRACEROUTE_HOPS_DEFAULT))
@@ -135,6 +141,7 @@ def run_check(cfg: dict, state_file, probe=None, alert_on: str = "change") -> di
             ping_count=ping_count, ping_timeout=ping_timeout,
             tcp_timeout=tcp_timeout, http_timeout=http_timeout,
             dns_timeout=dns_timeout,
+            snmp_timeout=snmp_timeout, snmp_community=snmp_community,
         )
 
         # 连续离线计数：通了立刻归零，离线就累加，达到阈值才算「异常」

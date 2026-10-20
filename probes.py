@@ -488,10 +488,345 @@ def probe_traceroute(host: str,
     return ProbeResult("traceroute", host, bool(hop_list), ms, "%s（%dms）" % (summary, ms))
 
 
+# ---------------------------------------------------------------- SNMP（v2c GET，零依赖）
+#
+# 巡检只需要「问一个 OID 的值」这一件事，为此引入 pysnmp + pyasn1 两个依赖不划算：
+# v2c 的 GetRequest 一共 40 个字节，编解码各几十行就够。报文结构已用 pysnmp 7.1.30
+# 交叉验证过（它解得开我们发的包，我们解得出它构造的应答，见 tests/test_snmp.py）。
+# 不做：v3（要 USM 认证/加密）、getnext/walk、trap 接收 —— 需要这些请直接上 pysnmp。
+SNMP_TIMEOUT_DEFAULT = 2      # 秒
+SNMP_COMMUNITY_DEFAULT = "public"
+
+# 常用 OID 起个名，配置里写 snmp:sysDescr 比写一长串数字好认（也少打错）
+SNMP_NAMES = {
+    "sysDescr": "1.3.6.1.2.1.1.1.0",      # 设备描述（型号/系统）
+    "sysName": "1.3.6.1.2.1.1.5.0",       # 主机名
+    "sysUpTime": "1.3.6.1.2.1.1.3.0",     # 运行时长（TimeTicks）
+    "sysLocation": "1.3.6.1.2.1.1.6.0",   # 位置
+    "sysContact": "1.3.6.1.2.1.1.4.0",    # 联系人
+}
+
+_SNMP_ERR = {0: "noError", 1: "tooBig", 2: "noSuchName", 3: "badValue",
+             4: "readOnly", 5: "genErr"}
+_SNMP_MISSING = {0x80: "noSuchObject", 0x81: "noSuchInstance", 0x82: "endOfMibView"}
+
+
+def encode_oid(dotted: str) -> bytes:
+    """把 "1.3.6.1.2.1.1.1.0" 编成 BER 的 OID 内容字节（不含 tag/长度）。"""
+    parts = [p for p in str(dotted).strip().split(".") if p != ""]
+    if len(parts) < 2:
+        raise ValueError("OID 至少要有两段: %r" % dotted)
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        raise ValueError("OID 里有非数字段: %r" % dotted)
+    if any(n < 0 for n in nums):
+        raise ValueError("OID 段不能是负数: %r" % dotted)
+    if nums[0] > 2 or (nums[0] < 2 and nums[1] > 39):
+        raise ValueError("OID 开头不合法: %r（第一段 ≤2，第一段<2 时第二段 ≤39）" % dotted)
+    out = bytearray(_oid_varint(nums[0] * 40 + nums[1]))
+    for n in nums[2:]:
+        out.extend(_oid_varint(n))
+    return bytes(out)
+
+
+def _oid_varint(n: int) -> bytes:
+    """OID 子标识符的 base-128 变长编码（第一段 2.100 这种合成值也是这么编的）。"""
+    chunk = [n & 0x7F]
+    n >>= 7
+    while n:
+        chunk.append((n & 0x7F) | 0x80)
+        n >>= 7
+    return bytes(reversed(chunk))
+
+
+def decode_oid(raw: bytes) -> str:
+    """encode_oid 的逆操作：BER OID 内容字节 → 点分字符串。"""
+    if not raw:
+        raise ValueError("OID 内容为空")
+    vals = []
+    val = 0
+    for byte in raw:
+        val = (val << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            vals.append(val)
+            val = 0
+    if raw[-1] & 0x80:
+        raise ValueError("OID 编码被截断")
+    first = vals[0]
+    if first < 40:
+        nums = [0, first]
+    elif first < 80:
+        nums = [1, first - 40]
+    else:
+        nums = [2, first - 80]
+    nums.extend(vals[1:])
+    return ".".join(str(n) for n in nums)
+
+
+def _ber_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(body)]) + body
+
+
+def _ber_tlv(tag: int, payload: bytes) -> bytes:
+    return bytes([tag]) + _ber_len(len(payload)) + payload
+
+
+def _ber_int(value: int) -> bytes:
+    """最小长度补码编码（正数最高位是 1 时前面补 0x00，避免被读成负数）。"""
+    if value >= 0:
+        body = value.to_bytes(max(1, (value.bit_length() + 8) // 8), "big")
+    else:
+        width = max(1, ((value + 1).bit_length() + 8) // 8)
+        body = value.to_bytes(width, "big", signed=True)
+    return _ber_tlv(0x02, body)
+
+
+def build_snmp_get(oid: str, community: str = SNMP_COMMUNITY_DEFAULT,
+                   request_id: int = 1) -> bytes:
+    """构造 v2c GetRequest（纯函数，便于和抓包/其它实现比对）。"""
+    if not 0 <= request_id < 0x80000000:
+        # request-id 是 Integer32：越界会编码成 5~6 字节，严格实现的 agent 会拒收
+        raise ValueError("request-id 超出 Integer32: %r" % (request_id,))
+    varbind = _ber_tlv(0x30, _ber_tlv(0x06, encode_oid(oid)) + _ber_tlv(0x05, b""))
+    pdu_body = (_ber_int(request_id) + _ber_int(0) + _ber_int(0)
+                + _ber_tlv(0x30, varbind))
+    comm = str(community).encode("utf-8", "replace")
+    body = _ber_int(1) + _ber_tlv(0x04, comm) + _ber_tlv(0xA0, pdu_body)   # 0xA0 = GetRequest
+    return _ber_tlv(0x30, body)
+
+
+def _read_tlv(buf: bytes, i: int):
+    """从 buf[i] 读一个 TLV，返回 (tag, payload, 下一个位置)。"""
+    if i + 2 > len(buf):
+        raise ValueError("报文被截断（读 tag/长度时越界）")
+    tag = buf[i]
+    i += 1
+    first = buf[i]
+    i += 1
+    if first < 0x80:
+        length = first
+    else:
+        num = first & 0x7F
+        if num == 0 or i + num > len(buf):
+            raise ValueError("长度字段不合法")
+        length = int.from_bytes(buf[i:i + num], "big")
+        i += num
+    if i + length > len(buf):
+        raise ValueError("报文被截断（声明 %d 字节，实际只剩 %d）" % (length, len(buf) - i))
+    return tag, buf[i:i + length], i + length
+
+
+def _read_int(payload: bytes) -> int:
+    if not payload:
+        raise ValueError("INTEGER 内容为空")
+    return int.from_bytes(payload, "big", signed=True)
+
+
+def parse_snmp_response(data: bytes) -> dict:
+    """解析 v2c 应答报文；结构不对就抛 ValueError（调用方统一兜成一行明细）。
+
+    返回 ``{version, community, pdu_tag, request_id, error_status, error_index,
+    varbinds: [(oid, 值tag, 值内容)]}``。注意这里**不判业务成败**，只负责解包。
+    """
+    tag, body, _ = _read_tlv(data, 0)
+    if tag != 0x30:
+        raise ValueError("不是 SEQUENCE（tag=0x%02x）" % tag)
+    i = 0
+    tag, ver, i = _read_tlv(body, i)
+    if tag != 0x02:
+        raise ValueError("version 字段不是 INTEGER")
+    version = _read_int(ver)
+    tag, comm, i = _read_tlv(body, i)
+    if tag != 0x04:
+        raise ValueError("community 字段不是 OCTET STRING")
+    tag, pdu, i = _read_tlv(body, i)
+    if tag not in (0xA2, 0xA8):          # A2=Response, A8=Report（v3 的 report 也可能是 A8）
+        raise ValueError("不是 GetResponse（tag=0x%02x，可能是错误或 trap）" % tag)
+
+    j = 0
+    tag, raw_id, j = _read_tlv(pdu, j)
+    request_id = _read_int(raw_id) if tag == 0x02 else None
+    tag, raw_err, j = _read_tlv(pdu, j)
+    error_status = _read_int(raw_err) if tag == 0x02 else 0
+    tag, raw_idx, j = _read_tlv(pdu, j)
+    error_index = _read_int(raw_idx) if tag == 0x02 else 0
+
+    varbinds = []
+    tag, vbl, _ = _read_tlv(pdu, j)
+    if tag == 0x30:
+        k = 0
+        while k < len(vbl):
+            t, one, k = _read_tlv(vbl, k)
+            if t != 0x30:
+                raise ValueError("VarBind 不是 SEQUENCE")
+            m = 0
+            t_oid, raw_oid, m = _read_tlv(one, m)
+            t_val, raw_val, m = _read_tlv(one, m)
+            if t_oid != 0x06:
+                raise ValueError("VarBind 里的 OID 不是 OBJECT IDENTIFIER")
+            varbinds.append((decode_oid(raw_oid), t_val, raw_val))
+    return {
+        "version": version,
+        "community": comm.decode("utf-8", "replace"),
+        "pdu_tag": tag,
+        "request_id": request_id,
+        "error_status": error_status,
+        "error_index": error_index,
+        "varbinds": varbinds,
+    }
+
+
+def fmt_snmp_value(tag: int, raw: bytes, limit: int = 120) -> str:
+    """把 varbind 的值渲染成一行可读文本（只影响观感，不参与判定）。"""
+    if tag in _SNMP_MISSING:
+        return "<%s>" % _SNMP_MISSING[tag]
+    if tag == 0x02:
+        return str(int.from_bytes(raw, "big", signed=True)) if raw else "0"
+    if tag in (0x41, 0x42, 0x46):        # Counter32 / Gauge32 / Counter64
+        return str(int.from_bytes(raw, "big", signed=False)) if raw else "0"
+    if tag == 0x43:                      # TimeTicks：百分之一秒，人看得懂的是多久
+        ticks = int.from_bytes(raw, "big", signed=False) if raw else 0
+        return "%d ticks (%s)" % (ticks, _fmt_ticks(ticks))
+    if tag == 0x06:
+        try:
+            return decode_oid(raw)
+        except ValueError:
+            return "0x" + raw.hex()
+    if tag == 0x40:
+        return ".".join(str(b) for b in raw) if len(raw) == 4 else "0x" + raw.hex()
+    if tag == 0x05:
+        return "-"
+    if tag == 0x04:
+        text = raw.decode("utf-8", "replace")
+        if all(ch.isprintable() for ch in text):
+            return '"%s"' % (text if len(text) <= limit else text[:limit] + "…")
+        return "0x" + raw.hex()
+    return "0x" + raw.hex()
+
+
+def _fmt_ticks(ticks: int) -> str:
+    secs = ticks // 100
+    days, rest = divmod(secs, 86400)
+    hours, rest = divmod(rest, 3600)
+    mins, secs = divmod(rest, 60)
+    return "%dd %02d:%02d:%02d" % (days, hours, mins, secs)
+
+
+def snmp_target(raw) -> str:
+    """``snmp:`` 后面的部分 → OID 点分串。支持预设名（大小写不敏感）或直接写 OID。"""
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("snmp: 后面要跟 OID 或预设名（sysDescr / sysName / sysUpTime …）")
+    for name, oid in SNMP_NAMES.items():
+        if text.lower() == name.lower():
+            return oid
+    encode_oid(text)          # 只想借它做合法性校验，不合法会抛 ValueError
+    return text
+
+
+def snmp_label(oid: str) -> str:
+    """OID → 报告里显示的短名（预设名优先，认不出就原样显示点分串）。"""
+    for name, value in SNMP_NAMES.items():
+        if value == oid:
+            return name
+    return oid
+
+
+def _snmp_request_id() -> int:
+    """请求 id：毫秒时间戳**截到 31 位**。
+
+    截断不是为了省字节：request-id 在协议里是 Integer32（有符号 32 位），
+    而毫秒时间戳是 41 位 —— 按原值编码会变成一个 6 字节整数，严格实现的 agent 直接拒收。
+    """
+    return int(time.time() * 1000) & 0x7FFFFFFF
+
+
+def probe_snmp(host: str, target, community: str = SNMP_COMMUNITY_DEFAULT,
+               timeout=SNMP_TIMEOUT_DEFAULT, port: int = 161) -> ProbeResult:
+    """SNMP v2c GET 探测：问一个 OID 的值。
+
+    判定 = 「收到合法应答 + error-status 为 0 + 值不是 noSuch*」。
+    明细必须分清三种失败：**没有应答**（设备没开 SNMP / 团体名不对 / 被 ACL 拦）、
+    **端口不可达**（对端根本没有 SNMP 服务，Windows 会回 ICMP 拒绝）、
+    **应答报错**（OID 不存在 / 该 OID 不可读）—— 三者运维处置完全不同。
+    团体名属于凭据，**不进明细**（明细会进报告、历史库、HTML）。
+    """
+    oid = snmp_target(target)
+    label = snmp_label(oid)
+    target_txt = label
+    req_id = _snmp_request_id()
+
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_DGRAM)
+    except socket.gaierror as e:
+        return ProbeResult("snmp", target=str(target), ok=False, ms=0,
+                           detail="SNMP 目标解析失败 (%s)" % _short(e))
+    family = infos[0][0]
+    addr = infos[0][4]
+
+    t0 = time.perf_counter()
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(addr)         # connect 后 recv 只收这个对端，也才收得到 ICMP 报错
+        sock.send(build_snmp_get(oid, community, req_id))
+        deadline = time.perf_counter() + timeout
+        while True:
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                raise socket.timeout()
+            sock.settimeout(left)
+            data = sock.recv(4096)
+            rtt = int((time.perf_counter() - t0) * 1000)
+            try:
+                parsed = parse_snmp_response(data)
+            except ValueError as e:
+                return ProbeResult("snmp", target_txt, False, int((time.perf_counter() - t0) * 1000),
+                                   "SNMP 应答无法解析（%d 字节）: %s" % (len(data), _short(e)))
+            if parsed.get("request_id") not in (None, req_id):
+                continue           # 不是我们这一问的应答（重发/串包），接着等
+            break
+    except socket.timeout:
+        ms = int((time.perf_counter() - t0) * 1000)
+        return ProbeResult("snmp", target_txt, False, ms,
+                           "SNMP 无应答 (>%ss)：设备可能没开 SNMP、团体名不对或被 ACL 拦" % _fmt_secs(timeout))
+    except ConnectionResetError:
+        ms = int((time.perf_counter() - t0) * 1000)
+        return ProbeResult("snmp", target_txt, False, ms,
+                           "SNMP 端口不可达（对端 %d 没有 SNMP 服务，回了 ICMP 拒绝）" % port)
+    except OSError as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        return ProbeResult("snmp", target_txt, False, ms, "SNMP 探测失败 (%s)" % _short(e))
+    finally:
+        sock.close()
+
+    ms = int((time.perf_counter() - t0) * 1000)
+    status = parsed.get("error_status") or 0
+    if status:
+        err = _SNMP_ERR.get(status, "unknown")
+        return ProbeResult("snmp", target_txt, False, ms,
+                           "SNMP 返回错误 %s(%d)，error-index=%s——该 OID 读不到"
+                           % (err, status, parsed.get("error_index")), rtt)
+    if not parsed["varbinds"]:
+        return ProbeResult("snmp", target_txt, False, ms, "SNMP 应答里没有 varbind", rtt)
+    oid_back, vt, raw_val = parsed["varbinds"][0]
+    text = fmt_snmp_value(vt, raw_val)
+    if vt in _SNMP_MISSING:
+        return ProbeResult("snmp", target_txt, False, ms,
+                           "SNMP %s → %s（设备上没有这个 OID）" % (label, text), rtt)
+    return ProbeResult("snmp", target_txt, True, ms,
+                       "SNMP %s = %s (%dms)" % (label, text, rtt), rtt)
+
+
 def parse_checks(raw) -> list:
     """把配置里的 checks 规范化成探测指令列表（纯函数）。
 
-    合法写法：``icmp`` / ``tcp:22`` / ``dns:example.com`` / ``http://host:port/path`` / ``https://...``
+    合法写法：``icmp`` / ``tcp:22`` / ``dns:example.com`` / ``snmp:sysDescr`` / ``snmp:1.3.6.1.2.1.1.1.0``
+    / ``http://host:port/path`` / ``https://...``
     不写（None 或空）→ 默认 ``["icmp"]``；写错直接抛 ValueError，让配置问题当场暴露。
     """
     if raw is None or raw == "" or raw == []:
@@ -517,10 +852,12 @@ def parse_checks(raw) -> list:
             if not name or any(c.isspace() for c in name) or "/" in name:
                 raise ValueError("checks 里的 DNS 域名不合法: %r（形如 dns:example.com）" % s)
             out.append("dns:" + name)
+        elif low.startswith("snmp:"):
+            out.append("snmp:" + snmp_target(s.split(":", 1)[1]))
         elif low.startswith("http://") or low.startswith("https://"):
             out.append(s)
         else:
-            raise ValueError("不认识的 check: %r（支持 icmp / tcp:PORT / dns:HOST / http(s)://…）" % s)
+            raise ValueError("不认识的 check: %r（支持 icmp / tcp:PORT / dns:HOST / snmp:OID / http(s)://…）" % s)
     return out
 
 
@@ -535,7 +872,9 @@ def run_checks(host: str,
                ping_timeout: int = PING_TIMEOUT_DEFAULT,
                tcp_timeout: int = TCP_TIMEOUT_DEFAULT,
                http_timeout: int = HTTP_TIMEOUT_DEFAULT,
-               dns_timeout: int = DNS_TIMEOUT_DEFAULT):
+               dns_timeout: int = DNS_TIMEOUT_DEFAULT,
+               snmp_timeout: int = SNMP_TIMEOUT_DEFAULT,
+               snmp_community: str = SNMP_COMMUNITY_DEFAULT):
     """执行一台设备的全部探测。
 
     返回 ``(是否在线, detail 汇总, [ProbeResult, ...])``。
@@ -551,6 +890,8 @@ def run_checks(host: str,
             results.append(probe_tcp(host, int(item.split(":", 1)[1]), tcp_timeout))
         elif item.startswith("dns:"):
             results.append(probe_dns(item.split(":", 1)[1], dns_timeout))
+        elif item.startswith("snmp:"):
+            results.append(probe_snmp(host, item.split(":", 1)[1], snmp_community, snmp_timeout))
         else:
             results.append(probe_http(item, http_timeout))
 

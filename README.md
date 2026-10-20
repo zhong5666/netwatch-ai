@@ -157,12 +157,18 @@ devices:
     ip: 223.5.5.5
     checks: [dns:www.baidu.com]                           # 解析失败即判异常（抓 DNS 故障）
 
+  - name: core-sw
+    ip: 192.168.1.2
+    checks: [icmp, snmp:sysUpTime]                        # 顺带看它跑了多久：重启过会被抓到
+
 check:
   ping_count: 3          # 每次 ping 几个包
   ping_timeout: 1        # 单包超时(秒)
   tcp_timeout: 2         # TCP 连接超时(秒)
   http_timeout: 3        # HTTP 请求超时(秒)
   dns_timeout: 5         # DNS 解析超时(秒)
+  snmp_timeout: 2        # SNMP 等应答超时(秒)
+  snmp_community: public # 团体名（凭据：可用 NETWATCH_SNMP_COMMUNITY 覆盖；不会进报告/历史库）
   down_threshold: 2      # 连续 N 轮离线才算异常（抗网络抖动）
   traceroute: auto       # 设备判定异常时按需补跑一次（auto 默认 = 开；false 关掉）
   traceroute_hops: 5     # traceroute 最多探几跳
@@ -184,8 +190,22 @@ notify:                       # 通知渠道（可选；不配就只打印到终
 | `tcp:22` | TCP 端口能否建立连接 |
 | `http://ip:port/path` | HTTP 有没有响应（4xx 算在线，5xx 算异常） |
 | `dns:example.com` | 域名能否解析成 IP（走系统解析器，用 `dns_timeout` 兜超时） |
+| `snmp:sysDescr` | 问一个 OID 的值（SNMP **v2c GET**）。预设名：`sysDescr` / `sysName` / `sysUpTime` / `sysLocation` / `sysContact`，也可以直接写 `snmp:1.3.6.1.2.1.1.3.0` |
 
 多个 check 是 **AND** 语义：任意一项失败即判该设备异常，但**明细全部保留**。
+
+**SNMP 只做 v2c 的单点 GET**，够用就行：它抓的是 ICMP 看不出来的事 —— 设备还 ping 得通、但最近重启过（`sysUpTime` 掉回几十秒）、主机名/位置/型号对不上。没有引 pysnmp：v2c 的 GetRequest 一共 40 个字节，编解码自己写（`probes.py` 里 `build_snmp_get` / `parse_snmp_response`），报文结构用 pysnmp 7.1.30 交叉验证过 —— `tests/test_snmp.py` 里的参照字节都是它生成的，我们发的包必须和它**字节级相同**，它造的应答我们必须解得对。
+
+四种失败分得清，因为处置完全不同：
+
+| 明细里的说法 | 真实含义 |
+|---|---|
+| `SNMP 无应答` | 设备没开 SNMP / 团体名不对 / 被 ACL 拦（**不是主机不可达**） |
+| `SNMP 端口不可达` | 对端 161 根本没有服务，回了 ICMP 拒绝 |
+| `SNMP 返回错误 noSuchName(2)` | 应答报错：OID 不存在或不可读 |
+| `→ <noSuchInstance>` | 设备认得这个 OID，但这一项没有实例 |
+
+团体名是**凭据**：只从配置或 `NETWATCH_SNMP_COMMUNITY` 取，不进明细、不进历史库、不进 HTML。没做的：v3（USM 认证/加密）、getnext/walk、trap 接收 —— 需要这些请直接上 pysnmp。
 
 traceroute 不是 check —— 它是**判定异常之后**的补充诊断，写在 `check.traceroute`，不参与 AND 判定，也不进「探测耗时 / 平均RTT」口径。
 
@@ -389,11 +409,17 @@ schtasks /create /tn netwatch /sc minute /mo 10 ^
 10. **演示脚本的结束标记不能靠缩进猜**：`refresh_demo.py` 原来用「第一行以 `└` 开头」当报告结束位置，而明细行都有 6 个空格前缀 —— 这个条件永远不成立，脚本直接 `StopIteration` 崩掉；就算改成 `strip()` 后再匹配也会把 AI 卡片截掉。改成「下一场的 `====` 标题行」才对。这条规则现在住在 `tools/sync_readme_block.py`（「效果」段与「可用率报告」段共用这一份实现，不再各写一套切块逻辑）。
 11. **端口没清干净会让演示假通过**：`demo/run_demo.py` 的场景二是 kill 掉自己起的 8899 服务，但如果机器上早有个 8899 的监听（比如上次调试留下的 `http.server`），kill 掉自己的子进程后端口照样有人应答 —— 巡检报告显示「服务在线」，README 引用的输出就变成假的。跑演示前先 `netstat -ano | findstr :8899` 确认没人占。
 
+12. **SNMP 的 Gauge32 / Counter32 是无符号的**：`0xffffffff` 若按有符号整数解会变成 `-1`，网卡流量、接口计数全会显示成负数。按 tag 区分（`0x41`/`0x42`/`0x46` 走无符号）已经写成测试 `test_counter_is_unsigned_not_signed`。
+13. **OID 的前两段是「合成」成一个子标识符的**（`40*第一段+第二段`），而这个合成值同样要按 base-128 变长编码：`2.100.3` 编出来是 `81 34 03`，不是 `b4 03`。一开始按「单字节」写，只对 `1.3.6.x` 这种常见前缀碰巧正确。
+14. **SNMP 团体名是凭据**：明细会流进终端、历史库、HTML 报告和 AI prompt，所以「无应答」的提示里只说「没开 SNMP 或团体名不对」，**永不回显团体名本身**（`test_probe_detail_never_leaks_community`）。
+15. **UDP 的「端口不可达」在 Windows 上是 `ConnectionResetError [WinError 10054]`**：如果只 catch `socket.timeout`，对端 161 没服务时会直接抛异常把整轮巡检打断。要单独 catch 出来，报「SNMP 端口不可达」而不是「主机不可达」。
+16. **手写协议需要外部参照，不然是「两边一起错」**：我们自己编码、自己解码，写歪了测试也照样绿。所以参照报文由 pysnmp 7.1.30 独立生成并写死进测试（我们发的包必须与它字节级相同，它造的应答我们必须解得对），pysnmp 本身不进依赖、不进 CI。
+
 ## 测试
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q        # 256 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / README 引用段同步 / py3.9 兼容闸门 / CLI 行为
+pytest -q        # 298 个用例，覆盖探测逻辑（含 DNS 超时与影响面规则 / SNMP 报文编解码与参照报文比对）/ RTT 与墙钟两种耗时口径 / 阈值状态机 / 告警去重 / 恢复通知 / 历史统计（含老库迁移）/ AI 输出解析与卡片渲染 / 通知渠道与两道闸门 / 静态报告 / README 引用段同步 / py3.9 兼容闸门 / CLI 行为
 ```
 
 本仓库的 Python floor 是 **3.9**（CI 是 Win·macOS·Linux × 3.9/3.11/3.12 九个作业）。本地 venv 通常是 3.11，用了 3.10+ 的 API 会「本地全绿、CI 三个 3.9 作业红」，所以有两道自检：
@@ -413,7 +439,7 @@ python tools/sync_readme_block.py                                     # README �
 - [x] 通知渠道插件化：`notifiers.py` + webhook 渠道（钉钉 / 企业微信待接）
 - [x] 探测项扩展 · DNS 解析：`dns:域名` + `dns_timeout`，明细写「解析失败」而非「不可达」，规则层认得扎堆的 DNS 故障
 - [x] 探测项扩展 · traceroute（只在判定不通时按需跑）
-- [ ] 探测项扩展 · SNMP
+- [x] 探测项扩展 · SNMP：`snmp:sysUpTime` 等 5 个预设 + 任意 OID，v2c 单点 GET 自己编解码（零新依赖），四种失败分类
 - [x] 小口径修复 · 两种耗时分开：**探测耗时**（墙钟，`ping -n 3` 天然 ~1s）与**平均RTT**（真实往返）各占一列，ICMP 明细直接显示 `RTT 35ms`
 - [x] 轻量面板 · 落地为静态单文件 HTML：只读历史库，跑完即退，无常驻/无端口/零依赖
 
@@ -422,7 +448,7 @@ python tools/sync_readme_block.py                                     # README �
 ```
 netwatch-ai/
 ├── netwatch.py              编排层：巡检主流程 + 告警去重 + 报告
-├── probes.py                探测层：ICMP / TCP / HTTP / DNS 解析
+├── probes.py                探测层：ICMP / TCP / HTTP / DNS 解析 / SNMP v2c GET
 ├── analyzer.py              AI 层：规则判断 + 大模型分析
 ├── notifiers.py             通知层：webhook 插件化推送（失败不影响巡检）
 ├── history.py               历史层：SQLite 落库 + 可用率统计
